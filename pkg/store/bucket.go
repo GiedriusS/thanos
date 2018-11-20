@@ -169,6 +169,9 @@ type BucketStore struct {
 
 	// Verbose enabled additional logging.
 	debugLogging bool
+
+	// Maximum size of preload chunk bytes
+	maxPreloadBytes int
 }
 
 // NewBucketStore creates a new bucket backed store that implements the store API against
@@ -181,6 +184,7 @@ func NewBucketStore(
 	indexCacheSizeBytes uint64,
 	maxChunkPoolBytes uint64,
 	debugLogging bool,
+	maxPreloadBytes int,
 ) (*BucketStore, error) {
 	if logger == nil {
 		logger = log.NewNopLogger()
@@ -194,14 +198,15 @@ func NewBucketStore(
 		return nil, errors.Wrap(err, "create chunk pool")
 	}
 	s := &BucketStore{
-		logger:       logger,
-		bucket:       bucket,
-		dir:          dir,
-		indexCache:   indexCache,
-		chunkPool:    chunkPool,
-		blocks:       map[ulid.ULID]*bucketBlock{},
-		blockSets:    map[uint64]*bucketBlockSet{},
-		debugLogging: debugLogging,
+		logger:          logger,
+		bucket:          bucket,
+		dir:             dir,
+		indexCache:      indexCache,
+		chunkPool:       chunkPool,
+		blocks:          map[ulid.ULID]*bucketBlock{},
+		blockSets:       map[uint64]*bucketBlockSet{},
+		debugLogging:    debugLogging,
+		maxPreloadBytes: maxPreloadBytes,
 	}
 	s.metrics = newBucketStoreMetrics(reg)
 
@@ -705,7 +710,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 
 			// We must keep the readers open until all their data has been sent.
 			indexr := b.indexReader(ctx)
-			chunkr := b.chunkReader(ctx)
+			chunkr := b.chunkReader(ctx, s.maxPreloadBytes)
 
 			// Defer all closes to the end of Series method.
 			defer runutil.CloseWithLogOnErr(s.logger, indexr, "series block")
@@ -1144,9 +1149,9 @@ func (b *bucketBlock) indexReader(ctx context.Context) *bucketIndexReader {
 	return newBucketIndexReader(ctx, b.logger, b, b.indexCache)
 }
 
-func (b *bucketBlock) chunkReader(ctx context.Context) *bucketChunkReader {
+func (b *bucketBlock) chunkReader(ctx context.Context, maxChunkPreloadBytes int) *bucketChunkReader {
 	b.pendingReaders.Add(1)
-	return newBucketChunkReader(ctx, b)
+	return newBucketChunkReader(ctx, b, maxChunkPreloadBytes)
 }
 
 // Close waits for all pending readers to finish and then closes all underlying resources.
@@ -1428,15 +1433,19 @@ type bucketChunkReader struct {
 
 	// Byte slice to return to the chunk pool on close.
 	chunkBytes [][]byte
+
+	// Max chunks preload size
+	maxPreloadBytes int
 }
 
-func newBucketChunkReader(ctx context.Context, block *bucketBlock) *bucketChunkReader {
+func newBucketChunkReader(ctx context.Context, block *bucketBlock, maxPreload int) *bucketChunkReader {
 	return &bucketChunkReader{
-		ctx:      ctx,
-		block:    block,
-		stats:    &queryStats{},
-		preloads: make([][]uint32, len(block.chunkObjs)),
-		chunks:   map[uint64]chunkenc.Chunk{},
+		ctx:             ctx,
+		block:           block,
+		stats:           &queryStats{},
+		preloads:        make([][]uint32, len(block.chunkObjs)),
+		chunks:          map[uint64]chunkenc.Chunk{},
+		maxPreloadBytes: maxPreload,
 	}
 }
 
@@ -1468,8 +1477,15 @@ func (r *bucketChunkReader) preload() error {
 			return uint64(offsets[i]), uint64(offsets[i]) + maxChunkSize
 		}, maxGapSize)
 
-		seq := seq
-		offsets := offsets
+		if r.maxPreloadBytes > 0 {
+			sum := 0
+			for _, p := range parts {
+				sum += p[1] - p[0]
+			}
+			if sum > r.maxPreloadBytes {
+				return errors.Errorf("sum of chunk preload bytes %v exceeded max %v", sum, r.maxPreloadBytes)
+			}
+		}
 
 		for _, p := range parts {
 			ctx, cancel := context.WithCancel(r.ctx)
