@@ -340,6 +340,7 @@ func (s *streamSeriesSet) Next() (ok bool) {
 	case <-ctx.Done():
 		// closeSeries to shutdown a goroutine in startStreamSeriesSet.
 		s.closeSeries()
+		close(s.recvCh)
 
 		err := errors.Wrap(ctx.Err(), timeoutMsg)
 		if s.partialResponse {
