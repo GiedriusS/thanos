@@ -1,3 +1,6 @@
 ---
 
-sponsors: []
+sponsors:
+    - name: "Adform"
+      url: "https://site.adform.com"
+      logo: "Adform_logo_grey_RGB.png"
