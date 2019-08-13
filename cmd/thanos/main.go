@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"math"
 	"net"
@@ -18,26 +19,27 @@ import (
 	"syscall"
 
 	gmetrics "github.com/armon/go-metrics"
-
 	gprom "github.com/armon/go-metrics/prometheus"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
-	"github.com/improbable-eng/thanos/pkg/runutil"
-	"github.com/improbable-eng/thanos/pkg/tracing"
 	"github.com/oklog/run"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/version"
+	"github.com/thanos-io/thanos/pkg/prober"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/tracing"
+	"github.com/thanos-io/thanos/pkg/tracing/client"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/status"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/alecthomas/kingpin.v2"
 )
 
 const (
@@ -65,20 +67,18 @@ func main() {
 	logFormat := app.Flag("log.format", "Log format to use.").
 		Default(logFormatLogfmt).Enum(logFormatLogfmt, logFormatJson)
 
-	gcloudTraceProject := app.Flag("gcloudtrace.project", "GCP project to send Google Cloud Trace tracings to. If empty, tracing will be disabled.").
-		String()
-	gcloudTraceSampleFactor := app.Flag("gcloudtrace.sample-factor", "How often we send traces (1/<sample-factor>). If 0 no trace will be sent periodically, unless forced by baggage item. See `pkg/tracing/tracing.go` for details.").
-		Default("1").Uint64()
+	tracingConfig := regCommonTracingFlags(app)
 
 	cmds := map[string]setupFunc{}
 	registerSidecar(cmds, app, "sidecar")
 	registerStore(cmds, app, "store")
 	registerQuery(cmds, app, "query")
 	registerRule(cmds, app, "rule")
-	registerCompact(cmds, app, "compact")
+	registerCompact(cmds, app)
 	registerBucket(cmds, app, "bucket")
 	registerDownsample(cmds, app, "downsample")
 	registerReceive(cmds, app, "receive")
+	registerChecks(cmds, app, "check")
 
 	cmd, err := app.Parse(os.Args[1:])
 	if err != nil {
@@ -122,8 +122,8 @@ func main() {
 		prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}),
 	)
 
-	prometheus.DefaultRegisterer = prometheus.WrapRegistererWithPrefix("thanos_", metrics)
-	// Memberlist uses go-metrics
+	prometheus.DefaultRegisterer = metrics
+	// Memberlist uses go-metrics.
 	sink, err := gprom.NewPrometheusSink()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "%s command failed", cmd))
@@ -143,8 +143,24 @@ func main() {
 	{
 		ctx := context.Background()
 
-		var closeFn func() error
-		tracer, closeFn = tracing.NewOptionalGCloudTracer(ctx, logger, *gcloudTraceProject, *gcloudTraceSampleFactor, *debugName)
+		var closer io.Closer
+		var confContentYaml []byte
+		confContentYaml, err = tracingConfig.Content()
+		if err != nil {
+			level.Error(logger).Log("msg", "getting tracing config failed", "err", err)
+			os.Exit(1)
+		}
+
+		if len(confContentYaml) == 0 {
+			level.Info(logger).Log("msg", "Tracing will be disabled")
+			tracer = client.NoopTracer()
+		} else {
+			tracer, closer, err = client.NewTracer(ctx, logger, metrics, confContentYaml)
+			if err != nil {
+				fmt.Fprintln(os.Stderr, errors.Wrapf(err, "tracing failed"))
+				os.Exit(1)
+			}
+		}
 
 		// This is bad, but Prometheus does not support any other tracer injections than just global one.
 		// TODO(bplotka): Work with basictracer to handle gracefully tracker mismatches, and also with Prometheus to allow
@@ -156,15 +172,17 @@ func main() {
 			<-ctx.Done()
 			return ctx.Err()
 		}, func(error) {
-			if err := closeFn(); err != nil {
-				level.Warn(logger).Log("msg", "closing tracer failed", "err", err)
+			if closer != nil {
+				if err := closer.Close(); err != nil {
+					level.Warn(logger).Log("msg", "closing tracer failed", "err", err)
+				}
 			}
 			cancel()
 		})
 	}
 
 	if err := cmds[cmd](&g, logger, metrics, tracer, *logLevel == "debug"); err != nil {
-		fmt.Fprintln(os.Stderr, errors.Wrapf(err, "%s command failed", cmd))
+		level.Error(logger).Log("err", errors.Wrapf(err, "%s command failed", cmd))
 		os.Exit(1)
 	}
 
@@ -294,6 +312,7 @@ func defaultGRPCServerOpts(logger log.Logger, reg *prometheus.Registry, tracer o
 	return append(opts, grpc.Creds(credentials.NewTLS(tlsCfg))), nil
 }
 
+// TODO Remove once all components are migrated to the new defaultHTTPListener.
 // metricHTTPListenGroup is a run.Group that servers HTTP endpoint with only Prometheus metrics.
 func metricHTTPListenGroup(g *run.Group, logger log.Logger, reg *prometheus.Registry, httpBindAddr string) error {
 	mux := http.NewServeMux()
@@ -309,6 +328,30 @@ func metricHTTPListenGroup(g *run.Group, logger log.Logger, reg *prometheus.Regi
 		level.Info(logger).Log("msg", "Listening for metrics", "address", httpBindAddr)
 		return errors.Wrap(http.Serve(l, mux), "serve metrics")
 	}, func(error) {
+		runutil.CloseWithLogOnErr(logger, l, "metric listener")
+	})
+	return nil
+}
+
+// defaultHTTPListener starts a run.Group that servers HTTP endpoint with default endpoints providing Prometheus metrics,
+// profiling and liveness/readiness probes.
+func defaultHTTPListener(g *run.Group, logger log.Logger, reg *prometheus.Registry, httpBindAddr string, readinessProber *prober.Prober) error {
+	mux := http.NewServeMux()
+	registerMetrics(mux, reg)
+	registerProfile(mux)
+	readinessProber.RegisterInMux(mux)
+
+	l, err := net.Listen("tcp", httpBindAddr)
+	if err != nil {
+		return errors.Wrap(err, "listen metrics address")
+	}
+
+	g.Add(func() error {
+		level.Info(logger).Log("msg", "listening for metrics", "address", httpBindAddr)
+		readinessProber.SetHealthy()
+		return errors.Wrap(http.Serve(l, mux), "serve metrics")
+	}, func(err error) {
+		readinessProber.SetNotHealthy(err)
 		runutil.CloseWithLogOnErr(logger, l, "metric listener")
 	})
 	return nil

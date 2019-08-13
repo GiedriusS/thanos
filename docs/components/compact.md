@@ -26,8 +26,6 @@ config:
 The compactor needs local disk space to store intermediate data for its processing. Generally, about 100GB are recommended for it to keep working as the compacted time ranges grow over time.
 On-disk data is safe to delete between restarts and should be the first attempt to get crash-looping compactors unstuck.
 
-## Deployment
-
 ## Flags
 
 [embedmd]:# (flags/compact.txt $)
@@ -42,14 +40,12 @@ Flags:
       --version                Show application version.
       --log.level=info         Log filtering level.
       --log.format=logfmt      Log format to use.
-      --gcloudtrace.project=GCLOUDTRACE.PROJECT
-                               GCP project to send Google Cloud Trace tracings
-                               to. If empty, tracing will be disabled.
-      --gcloudtrace.sample-factor=1
-                               How often we send traces (1/<sample-factor>). If
-                               0 no trace will be sent periodically, unless
-                               forced by baggage item. See
-                               `pkg/tracing/tracing.go` for details.
+      --tracing.config-file=<tracing.config-yaml-path>
+                               Path to YAML file that contains tracing
+                               configuration.
+      --tracing.config=<tracing.config-yaml>
+                               Alternative to 'tracing.config-file' flag.
+                               Tracing configuration in YAML.
       --http-address="0.0.0.0:10902"
                                Listen host:port for HTTP endpoints.
       --data-dir="./data"      Data directory in which to cache blocks and
@@ -60,8 +56,10 @@ Flags:
       --objstore.config=<bucket.config-yaml>
                                Alternative to 'objstore.config-file' flag.
                                Object store configuration in YAML.
-      --sync-delay=30m         Minimum age of fresh (non-compacted) blocks
-                               before they are being processed.
+      --consistency-delay=30m  Minimum age of fresh (non-compacted) blocks
+                               before they are being processed. Malformed blocks
+                               older than the maximum of consistency-delay and
+                               30m0s will be removed.
       --retention.resolution-raw=0d
                                How long to retain raw samples in bucket. 0d -
                                disables this retention
@@ -73,6 +71,11 @@ Flags:
                                hour) in bucket. 0d - disables this retention
   -w, --wait                   Do not exit after all compactions have been
                                processed and wait for new work.
+      --downsampling.disable   Disables downsampling. This is not recommended as
+                               querying long time ranges without non-downsampled
+                               data is not efficient and useful e.g it is not
+                               possible to render all samples for a human eye
+                               anyway
       --block-sync-concurrency=20
                                Number of goroutines to use when syncing block
                                metadata from object storage.

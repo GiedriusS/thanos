@@ -10,16 +10,17 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strconv"
 	"syscall"
 	"testing"
 	"time"
 
-	"github.com/improbable-eng/thanos/pkg/objstore/s3"
-	"github.com/improbable-eng/thanos/pkg/runutil"
-	"github.com/improbable-eng/thanos/pkg/store/storepb"
-	"github.com/improbable-eng/thanos/pkg/testutil"
 	"github.com/oklog/run"
 	"github.com/pkg/errors"
+	"github.com/thanos-io/thanos/pkg/objstore/s3"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/testutil"
 	"google.golang.org/grpc"
 )
 
@@ -30,6 +31,8 @@ var (
 	promHTTP            = func(i int) string { return fmt.Sprintf("localhost:%s", promHTTPPort(i)) }
 	promRemoteWriteHTTP = func(i int) string { return fmt.Sprintf("localhost:%s", promHTTPPort(100+i)) }
 
+	nodeExporterHTTP = func(i int) string { return fmt.Sprintf("localhost:%d", 9100+i) }
+
 	sidecarGRPC = func(i int) string { return fmt.Sprintf("127.0.0.1:%d", 19090+i) }
 	sidecarHTTP = func(i int) string { return fmt.Sprintf("127.0.0.1:%d", 19190+i) }
 
@@ -39,6 +42,7 @@ var (
 	rulerGRPC = func(i int) string { return fmt.Sprintf("127.0.0.1:%d", 19790+i) }
 	rulerHTTP = func(i int) string { return fmt.Sprintf("127.0.0.1:%d", 19890+i) }
 
+	remoteWriteEndpoint          = func(i int) string { return fmt.Sprintf("http://%s/api/v1/receive", remoteWriteReceiveHTTP(i)) }
 	remoteWriteReceiveHTTP       = func(i int) string { return fmt.Sprintf("127.0.0.1:%d", 18690+i) }
 	remoteWriteReceiveGRPC       = func(i int) string { return fmt.Sprintf("127.0.0.1:%d", 18790+i) }
 	remoteWriteReceiveMetricHTTP = func(i int) string { return fmt.Sprintf("127.0.0.1:%d", 18890+i) }
@@ -75,7 +79,7 @@ func (c *cmdExec) Start(stdout io.Writer, stderr io.Writer) error {
 
 func (c *cmdExec) Kill() error { return c.Process.Signal(syscall.SIGKILL) }
 
-func (c *cmdExec) String() string { return fmt.Sprintf("%s %s", c.Path, c.Args[1]) }
+func (c *cmdExec) String() string { return fmt.Sprintf("%s %v", c.Path, c.Args[1:]) }
 
 type cmdScheduleFunc func(workDir string) ([]Exec, error)
 
@@ -108,6 +112,7 @@ func scraper(i int, config string) cmdScheduleFunc {
 		cmds = append(cmds, newCmdExec(exec.Command(testutil.PrometheusBinary(),
 			"--config.file", promDir+"/prometheus.yml",
 			"--storage.tsdb.path", promDir,
+			"--storage.tsdb.max-block-duration", "2h",
 			"--log.level", "info",
 			"--web.listen-address", promHTTP(i),
 		)))
@@ -117,12 +122,14 @@ func scraper(i int, config string) cmdScheduleFunc {
 			"--http-address", sidecarHTTP(i),
 			"--prometheus.url", fmt.Sprintf("http://%s", promHTTP(i)),
 			"--tsdb.path", promDir,
-			"--cluster.disable",
 			"--log.level", "debug"))), nil
 	}
 }
 
-func receiver(i int, config string) cmdScheduleFunc {
+func receiver(i int, config string, replicationFactor int, receiveAddresses ...string) cmdScheduleFunc {
+	if len(receiveAddresses) == 0 {
+		receiveAddresses = []string{remoteWriteEndpoint(1)}
+	}
 	return func(workDir string) ([]Exec, error) {
 		promDir := fmt.Sprintf("%s/data/remote-write-prom%d", workDir, i)
 		if err := os.MkdirAll(promDir, 0777); err != nil {
@@ -140,48 +147,52 @@ func receiver(i int, config string) cmdScheduleFunc {
 			"--log.level", "info",
 			"--web.listen-address", promRemoteWriteHTTP(i),
 		)))
+
+		hashringsFileDir := fmt.Sprintf("%s/data/receiveFile%d", workDir, i)
+		if err := os.MkdirAll(hashringsFileDir, 0777); err != nil {
+			return nil, errors.Wrap(err, "create receive dir failed")
+		}
+
+		if err := ioutil.WriteFile(path.Join(hashringsFileDir, "hashrings.json"), []byte(generateHashringsFile(receiveAddresses)), 0666); err != nil {
+			return nil, errors.Wrap(err, "creating receive config failed")
+		}
+
 		return append(cmds, newCmdExec(exec.Command("thanos", "receive",
 			"--debug.name", fmt.Sprintf("remote-write-receive-%d", i),
 			"--grpc-address", remoteWriteReceiveGRPC(i),
 			"--http-address", remoteWriteReceiveMetricHTTP(i),
 			"--remote-write.address", remoteWriteReceiveHTTP(i),
+			"--labels", "receive=\"true\"",
+			"--labels", fmt.Sprintf(`replica="%d"`, i),
 			"--tsdb.path", promDir,
-			"--log.level", "debug"))), nil
+			"--log.level", "debug",
+			"--receive.replication-factor", strconv.Itoa(replicationFactor),
+			"--receive.local-endpoint", remoteWriteEndpoint(i),
+			"--receive.hashrings-file", path.Join(hashringsFileDir, "hashrings.json"),
+			"--receive.hashrings-file-refresh-interval", "5s"))), nil
 	}
 }
 
-func querier(i int, replicaLabel string, staticStores ...string) cmdScheduleFunc {
-	return func(_ string) ([]Exec, error) {
-		args := append(defaultQuerierFlags(i, replicaLabel),
-			"--cluster.gossip-interval", "200ms",
-			"--cluster.pushpull-interval", "200ms")
-		for _, s := range staticStores {
-			args = append(args, "--store", s)
-		}
-		return []Exec{newCmdExec(exec.Command("thanos", args...))}, nil
-	}
-}
-
-func querierWithStoreFlags(i int, replicaLabel string, storesAddresses ...string) cmdScheduleFunc {
+func querierWithStoreFlags(i int, replicaLabel string, storeAddresses ...string) cmdScheduleFunc {
 	return func(_ string) ([]Exec, error) {
 		args := defaultQuerierFlags(i, replicaLabel)
 
-		for _, addr := range storesAddresses {
+		for _, addr := range storeAddresses {
 			args = append(args, "--store", addr)
 		}
 		return []Exec{newCmdExec(exec.Command("thanos", args...))}, nil
 	}
 }
 
-func querierWithFileSD(i int, replicaLabel string, storesAddresses ...string) cmdScheduleFunc {
+func querierWithFileSD(i int, replicaLabel string, storeAddresses ...string) cmdScheduleFunc {
 	return func(workDir string) ([]Exec, error) {
 		queryFileSDDir := fmt.Sprintf("%s/data/queryFileSd%d", workDir, i)
 		if err := os.MkdirAll(queryFileSDDir, 0777); err != nil {
-			return nil, errors.Wrap(err, "create prom dir failed")
+			return nil, errors.Wrap(err, "create query dir failed")
 		}
 
-		if err := ioutil.WriteFile(queryFileSDDir+"/filesd.json", []byte(generateFileSD(storesAddresses)), 0666); err != nil {
-			return nil, errors.Wrap(err, "creating prom config failed")
+		if err := ioutil.WriteFile(queryFileSDDir+"/filesd.json", []byte(generateFileSD(storeAddresses)), 0666); err != nil {
+			return nil, errors.Wrap(err, "creating query SD config failed")
 		}
 
 		args := append(
@@ -344,7 +355,6 @@ func (c *sameProcessGRPCServiceExec) Start(stdout io.Writer, stderr io.Writer) e
 			srvChan <- err
 			_, _ = c.stderr.Write([]byte(fmt.Sprintf("server failed: %s", err)))
 		}
-
 	}()
 	c.srvChan = srvChan
 	return nil
@@ -357,6 +367,7 @@ func (c *sameProcessGRPCServiceExec) Wait() error {
 	}
 	return err
 }
+
 func (c *sameProcessGRPCServiceExec) Kill() error {
 	c.cancel()
 	c.srv.Stop()
@@ -545,6 +556,18 @@ func generateFileSD(addresses []string) string {
 	return conf
 }
 
+func generateHashringsFile(addresses []string) string {
+	conf := "[ { \"endpoints\": ["
+	for index, addr := range addresses {
+		conf += fmt.Sprintf("\"%s\"", addr)
+		if index+1 < len(addresses) {
+			conf += ","
+		}
+	}
+	conf += "] } ]"
+	return conf
+}
+
 func defaultQuerierFlags(i int, replicaLabel string) []string {
 	return []string{
 		"query",
@@ -553,13 +576,13 @@ func defaultQuerierFlags(i int, replicaLabel string) []string {
 		"--http-address", queryHTTP(i),
 		"--log.level", "debug",
 		"--query.replica-label", replicaLabel,
-		"--cluster.disable",
 		"--store.sd-dns-interval", "5s",
 	}
 }
 
 func defaultRulerFlags(i int, dbDir string, ruleDir string) []string {
-	return []string{"rule",
+	return []string{
+		"rule",
 		"--debug.name", fmt.Sprintf("rule-%d", i),
 		"--label", fmt.Sprintf(`replica="%d"`, i),
 		"--data-dir", dbDir,
@@ -568,7 +591,6 @@ func defaultRulerFlags(i int, dbDir string, ruleDir string) []string {
 		"--alertmanagers.url", "http://127.0.0.1:29093",
 		"--grpc-address", rulerGRPC(i),
 		"--http-address", rulerHTTP(i),
-		"--cluster.disable",
 		"--log.level", "debug",
 		"--query.sd-dns-interval", "5s",
 	}

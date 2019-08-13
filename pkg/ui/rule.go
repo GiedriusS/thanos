@@ -8,13 +8,14 @@ import (
 	"path"
 	"regexp"
 	"sort"
+	"time"
 
 	"github.com/go-kit/kit/log"
-	thanosrule "github.com/improbable-eng/thanos/pkg/rule"
-	"github.com/improbable-eng/thanos/pkg/store/storepb"
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/rules"
+	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	thanosrule "github.com/thanos-io/thanos/pkg/rule"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 type Rule struct {
@@ -37,6 +38,9 @@ func NewRuleUI(logger log.Logger, ruleManagers map[storepb.PartialResponseStrate
 
 func ruleTmplFuncs(queryURL string) template.FuncMap {
 	return template.FuncMap{
+		"since": func(t time.Time) time.Duration {
+			return time.Since(t) / time.Millisecond * time.Millisecond
+		},
 		"alertStateToClass": func(as rules.AlertState) string {
 			switch as {
 			case rules.StateInactive:
@@ -47,6 +51,16 @@ func ruleTmplFuncs(queryURL string) template.FuncMap {
 				return "danger"
 			default:
 				panic("unknown alert state")
+			}
+		},
+		"ruleHealthToClass": func(rh rules.RuleHealth) string {
+			switch rh {
+			case rules.HealthUnknown:
+				return "warning"
+			case rules.HealthGood:
+				return "success"
+			default:
+				return "danger"
 			}
 		},
 		"queryURL": func() string { return queryURL },
@@ -131,8 +145,10 @@ func (ru *Rule) root(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, path.Join(prefix, "/alerts"), http.StatusFound)
 }
 
-func (ru *Rule) Register(r *route.Router) {
-	instrf := prometheus.InstrumentHandlerFunc
+func (ru *Rule) Register(r *route.Router, ins extpromhttp.InstrumentationMiddleware) {
+	instrf := func(name string, next func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
+		return ins.NewHandler(name, http.HandlerFunc(next))
+	}
 
 	r.Get("/", instrf("root", ru.root))
 	r.Get("/alerts", instrf("alerts", ru.alerts))

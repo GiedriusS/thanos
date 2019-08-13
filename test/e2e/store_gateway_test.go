@@ -9,16 +9,16 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
-	"github.com/improbable-eng/thanos/pkg/objstore"
-	"github.com/improbable-eng/thanos/pkg/objstore/client"
-	"github.com/improbable-eng/thanos/pkg/objstore/s3"
-	"github.com/improbable-eng/thanos/pkg/promclient"
-	"github.com/improbable-eng/thanos/pkg/runutil"
-	"github.com/improbable-eng/thanos/pkg/testutil"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/tsdb/labels"
+	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/objstore/client"
+	"github.com/thanos-io/thanos/pkg/objstore/s3"
+	"github.com/thanos-io/thanos/pkg/promclient"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/testutil"
 	yaml "gopkg.in/yaml.v2"
 )
 
@@ -44,7 +44,7 @@ func TestStoreGatewayQuery(t *testing.T) {
 	exit, err := newSpinupSuite().
 		WithPreStartedMinio(s3Config).
 		Add(storeGateway(1, config)).
-		Add(querier(1, "replica", storeGatewayGRPC(1))).
+		Add(querierWithStoreFlags(1, "replica", storeGatewayGRPC(1))).
 		Exec(t, ctx, "test_store_gateway_query")
 	if err != nil {
 		t.Errorf("spinup failed: %v", err)
@@ -68,10 +68,10 @@ func TestStoreGatewayQuery(t *testing.T) {
 	extLset2 := labels.FromStrings("ext1", "value1", "replica", "2")
 
 	now := time.Now()
-	id1, err := testutil.CreateBlock(dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset, 0)
+	id1, err := testutil.CreateBlock(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset, 0)
 	testutil.Ok(t, err)
 
-	id2, err := testutil.CreateBlock(dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset2, 0)
+	id2, err := testutil.CreateBlock(ctx, dir, series, 10, timestamp.FromTime(now), timestamp.FromTime(now.Add(2*time.Hour)), extLset2, 0)
 	testutil.Ok(t, err)
 
 	l := log.NewLogfmtLogger(os.Stdout)

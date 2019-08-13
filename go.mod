@@ -1,17 +1,16 @@
-module github.com/improbable-eng/thanos
-
-replace github.com/cortexproject/cortex => github.com/bwplotka/cortex v0.0.0-20190416102825-ae4098d14a9c
+module github.com/thanos-io/thanos
 
 require (
 	cloud.google.com/go v0.34.0
-	github.com/Azure/azure-storage-blob-go v0.0.0-20181022225951-5152f14ace1c
+	github.com/Azure/azure-storage-blob-go v0.7.0
 	github.com/NYTimes/gziphandler v1.1.1
+	github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751 // indirect
 	github.com/armon/go-metrics v0.0.0-20180917152333-f0300d1749da
 	github.com/blang/semver v3.5.1+incompatible // indirect
 	github.com/bradfitz/gomemcache v0.0.0-20190329173943-551aad21a668 // indirect
 	github.com/cortexproject/cortex v0.0.0
 	github.com/fatih/structtag v1.0.0
-	github.com/fortytw2/leaktest v1.2.0
+	github.com/fortytw2/leaktest v1.3.0
 	github.com/fsnotify/fsnotify v1.4.7
 	github.com/go-kit/kit v0.8.0
 	github.com/gogo/protobuf v1.2.0
@@ -23,14 +22,12 @@ require (
 	github.com/gorilla/mux v1.7.1 // indirect
 	github.com/grpc-ecosystem/go-grpc-middleware v1.0.0
 	github.com/grpc-ecosystem/go-grpc-prometheus v0.0.0-20181025070259-68e3a13e4117
-	github.com/hashicorp/go-sockaddr v0.0.0-20180320115054-6d291a969b86
-	github.com/hashicorp/golang-lru v0.5.0
-	github.com/hashicorp/memberlist v0.1.0
-	github.com/julienschmidt/httprouter v1.1.0 // indirect
+	github.com/hashicorp/golang-lru v0.5.1
+	github.com/leanovate/gopter v0.2.4
 	github.com/lovoo/gcloud-opentracing v0.3.0
-	github.com/miekg/dns v1.0.8
-	github.com/minio/minio-go v0.0.0-20190131015406-c8a261de75c1
-	github.com/mozillazg/go-cos v0.11.0
+	github.com/miekg/dns v1.1.15
+	github.com/minio/minio-go/v6 v6.0.27-0.20190529152532-de69c0e465ed
+	github.com/mozillazg/go-cos v0.12.0
 	github.com/mwitkow/go-conntrack v0.0.0-20161129095857-cc309e4a2223
 	github.com/oklog/run v1.0.0
 	github.com/oklog/ulid v1.3.1
@@ -62,6 +59,6 @@ require (
 	google.golang.org/appengine v1.4.0 // indirect
 	google.golang.org/grpc v1.17.0
 	gopkg.in/alecthomas/kingpin.v2 v2.2.6
-	gopkg.in/fsnotify/fsnotify.v1 v1.4.7 // indirect
+	gopkg.in/fsnotify.v1 v1.4.7
 	gopkg.in/yaml.v2 v2.2.2
 )

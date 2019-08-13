@@ -7,7 +7,7 @@ slug: /storage.md
 
 # Object Storage
 
-Thanos supports any object stores that can be implemented against Thanos [objstore.Bucket interface](https://github.com/improbable-eng/thanos/pkg/objstore/objstore.go)
+Thanos supports any object stores that can be implemented against Thanos [objstore.Bucket interface](/pkg/objstore/objstore.go)
 
 All clients are configured using `--objstore.config-file` to reference to the configuration file or `--objstore.config` to put yaml config directly.
 
@@ -28,20 +28,20 @@ NOTE: Currently Thanos requires strong consistency (write-read) for object store
 ## How to add a new client?
 
 1. Create new directory under `pkg/objstore/<provider>`
-2. Implement [objstore.Bucket interface](https://github.com/improbable-eng/thanos/pkg/objstore/objstore.go)
+2. Implement [objstore.Bucket interface](/pkg/objstore/objstore.go)
 3. Add `NewTestBucket` constructor for testing purposes, that creates and deletes temporary bucket.
-4. Use created `NewTestBucket` in [ForeachStore method](https://github.com/improbable-eng/thanos/pkg/objstore/objtesting/foreach.go) to ensure we can run tests against new provider. (In PR)
-5. RUN the [TestObjStoreAcceptanceTest](https://github.com/improbable-eng/thanos/pkg/objstore/objtesting/acceptance_e2e_test.go) against your provider to ensure it fits. Fix any found error until test passes. (In PR)
-6. Add client implementation to the factory in [factory](https://github.com/improbable-eng/thanos/pkg/objstore/client/factory.go) code. (Using as small amount of flags as possible in every command)
-7. Add client struct config to [bucketcfggen](https://github.com/improbable-eng/thanos/scripts/bucketcfggen/main.go) to allow config auto generation.
+4. Use created `NewTestBucket` in [ForeachStore method](/pkg/objstore/objtesting/foreach.go) to ensure we can run tests against new provider. (In PR)
+5. RUN the [TestObjStoreAcceptanceTest](/pkg/objstore/objtesting/acceptance_e2e_test.go) against your provider to ensure it fits. Fix any found error until test passes. (In PR)
+6. Add client implementation to the factory in [factory](/pkg/objstore/client/factory.go) code. (Using as small amount of flags as possible in every command)
+7. Add client struct config to [bucketcfggen](/scripts/bucketcfggen/main.go) to allow config auto generation.
 
-At that point, anyone can use your provider by spec
+At that point, anyone can use your provider by spec.
 
 ## AWS S3 configuration
 
-Thanos uses minio client to upload Prometheus data into AWS S3.
+Thanos uses the [minio client](https://github.com/minio/minio-go) library to upload Prometheus data into AWS S3.
 
-To configure S3 bucket as an object store you need to set these mandatory S3 variables in yaml format stored in a file:
+You can configure an S3 bucket as an object store with YAML, either by passing the configuration directly to the `--objstore.config` parameter, or (preferably) by passing the path to a configuration file to the `--objstore.config-file` option.
 
 [embedmd]:# (flags/config_s3.txt yaml)
 ```yaml
@@ -49,6 +49,7 @@ type: S3
 config:
   bucket: ""
   endpoint: ""
+  region: ""
   access_key: ""
   insecure: false
   signature_version2: false
@@ -57,20 +58,31 @@ config:
   put_user_metadata: {}
   http_config:
     idle_conn_timeout: 0s
+    response_header_timeout: 0s
     insecure_skip_verify: false
   trace:
     enable: false
+  part_size: 0
 ```
 
-AWS region to endpoint mapping can be found in this [link](https://docs.aws.amazon.com/general/latest/gr/rande.html#s3_region)
+At a minimum, you will need to provide a value for the `bucket`, `endpoint`, `access_key`, and `secret_key` keys. The rest of the keys are optional.
 
-Make sure you use a correct signature version.
-Currently AWS require signature v4, so it needs `signature-version2: false`, otherwise, you will get Access Denied error, but several other S3 compatible use `signature-version2: true`
+The AWS region to endpoint mapping can be found in this [link](https://docs.aws.amazon.com/general/latest/gr/rande.html#s3_region).
+
+Make sure you use a correct signature version. Currently AWS requires signature v4, so it needs `signature-version2: false`. If you don't specify it, you will get an `Access Denied` error. On the other hand, several S3 compatible APIs use `signature-version2: true`.
+
+You can configure the timeout settings for the HTTP client by setting the `http_config.idle_conn_timeout` and `http_config.response_header_timeout` keys. As a rule of thumb, if you are seeing errors like `timeout awaiting response headers` in your logs, you may want to increase the value of `http_config.response_header_timeout`.
+
+Please refer to the documentation of [the Transport type](https://golang.org/pkg/net/http/#Transport) in the `net/http` package for detailed information on what each option does.
+
+`part_size` is specified in bytes and refers to the minimum file size used for multipart uploads, as some custom S3 implementations may have different requirements. A value of `0` means to use a default 128 MiB size.
 
 For debug and testing purposes you can set
 
 * `insecure: true` to switch to plain insecure HTTP instead of HTTPS
+
 * `http_config.insecure_skip_verify: true` to disable TLS certificate verification (if your S3 based storage is using a self-signed certificate, for example)
+
 * `trace.enable: true` to enable the minio client's verbose logging. Each request and response will be logged into the debug logger, so debug level logging must be enabled for this functionality.
 
 ### Credentials
@@ -208,13 +220,27 @@ config:
 
 ### GCS Policies
 
+__Note:__ GCS Policies should be applied at the project level, not at the bucket level
+
 For deployment:
 
-`Storage Object Creator` and ` Storage Object Viewer`
+`Storage Object Creator` and `Storage Object Viewer`
 
 For testing:
 
 `Storage Object Admin` for ability to create and delete temporary buckets.
+
+To test the policy is working as expected, exec into the sidecar container, eg:
+
+```sh
+kubectl exec -it -n <namespace> <prometheus with sidecar pod name> -c <sidecar container name> -- /bin/sh
+```
+
+Then test that you can at least list objects in the bucket, eg:
+
+```sh
+thanos bucket ls --objstore.config="${OBJSTORE_CONFIG}"
+```
 
 ## Azure Configuration
 
@@ -231,12 +257,17 @@ config:
   storage_account: ""
   storage_account_key: ""
   container: ""
+  endpoint: ""
+  max_retries: 0
 ```
 
 ### OpenStack Swift Configuration
 Thanos uses [gophercloud](http://gophercloud.io/) client to upload Prometheus data into [OpenStack Swift](https://docs.openstack.org/swift/latest/).
 
-Below is an example configuration file for thanos to use OpenStack swift container as an object store.
+Below is an example configuration file for thanos to use OpenStack swift container as an object store.  
+Note that if the `name` of a user, project or tenant is used one must also specify its domain by ID or name.  
+Various examples for OpenStack authentication can be found in the [official documentation](https://developer.openstack.org/api-ref/identity/v3/index.html?expanded=password-authentication-with-scoped-authorization-detail#password-authentication-with-unscoped-authorization).
+
 
 [embedmd]:# (flags/config_swift.txt yaml)
 ```yaml
@@ -244,12 +275,16 @@ type: SWIFT
 config:
   auth_url: ""
   username: ""
+  user_domain_name: ""
+  user_domain_id: ""
   user_id: ""
   password: ""
   domain_id: ""
   domain_name: ""
-  tenant_id: ""
-  tenant_name: ""
+  project_id: ""
+  project_name: ""
+  project_domain_id: ""
+  project_domain_name: ""
   region_name: ""
   container_name: ""
 ```

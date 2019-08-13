@@ -4,12 +4,12 @@ import (
 	"math"
 	"sort"
 
-	"github.com/improbable-eng/thanos/pkg/compact/downsample"
-	"github.com/improbable-eng/thanos/pkg/store/storepb"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/tsdb/chunkenc"
+	"github.com/thanos-io/thanos/pkg/compact/downsample"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
 // promSeriesSet implements the SeriesSet interface of the Prometheus storage
@@ -152,7 +152,7 @@ func (s *chunkSeries) Iterator() storage.SeriesIterator {
 		}
 		sit = newChunkSeriesIterator(its)
 	default:
-		return errSeriesIterator{err: errors.Errorf("unexpected result aggreagte type %v", s.aggr)}
+		return errSeriesIterator{err: errors.Errorf("unexpected result aggregate type %v", s.aggr)}
 	}
 	return newBoundedSeriesIterator(sit, s.mint, s.maxt)
 }
@@ -395,7 +395,6 @@ func (s *dedupSeries) Iterator() (it storage.SeriesIterator) {
 
 type dedupSeriesIterator struct {
 	a, b storage.SeriesIterator
-	i    int
 
 	aok, bok   bool
 	lastT      int64

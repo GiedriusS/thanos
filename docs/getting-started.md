@@ -10,8 +10,8 @@ slug: /getting-started.md
 
 Thanos provides a global query view, data backup, and historical data access as its core features in a single binary. All three features can be run independently of each other. This allows you to have a subset of Thanos features ready for immediate benefit or testing, while also making it flexible for gradual roll outs in more complex environments. 
 
-In this quick-start guide, we will configure Thanos and all components mentioned to work against a Google Cloud Storage bucket.
-At the moment, Thanos is able to use [different storage providers](storage.md), with the ability to add more providers as necessary.
+In this quick-start guide, we will configure Thanos and all components mentioned to work against an object storage cloud provider.
+Thanos is able to use [different storage providers](storage.md), with the ability to add more providers as necessary.
 
 Thanos will work in cloud native environments as well as more traditional ones. Some users run Thanos in Kubernetes while others on bare metal. More deployments examples and stories will be described soon.
 
@@ -22,53 +22,35 @@ Thanos will work in cloud native environments as well as more traditional ones. 
 ## Requirements
 
 * One or more [Prometheus](https://prometheus.io) v2.2.1+ installations
-* golang 1.10+
+* golang 1.12+
 * An object storage bucket (optional)
 
 ## Get Thanos!
 
-You can find the latest Thanos release [here](https://github.com/improbable-eng/thanos/releases).
+You can find the latest Thanos release [here](https://github.com/thanos-io/thanos/releases).
 
 
-If you want to build Thanos from source, make sure you have installed `bzr` and `git`. `bzr` is required, because `go` modules will use whatever VCS dependency use and in our case a single deps is using `bzr`.
-And that you have a working installation of the Go [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`), Thanos can be downloaded and built by running:
+If you want to build Thanos from source you would need a working installation of the Go [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`).
+
+Thanos can be downloaded and built by running:
 
 ```bash
-go get -d github.com/improbable-eng/thanos/...
-cd ${GOPATH}/src/github.com/improbable-eng/thanos
+go get -d github.com/thanos-io/thanos/...
+cd ${GOPATH}/src/github.com/thanos-io/thanos
 make
 ```
 
 The `thanos` binary should now be in your `$PATH` and is the only thing required to deploy any of its components.
 
-You may meet below error:
-
-```
-go: verifying github.com/grpc-ecosystem/go-grpc-middleware@v1.0.0: checksum mismatch
-    downloaded: h1:BWIsLfhgKhV5g/oF34aRjniBHLTZe5DNekSjbAjIS6c=
-    go.sum:     h1:Iju5GlWwrvL6UBg4zJJt3btmonfrMlCDdsejg4CZE7c=
-Makefile:183: recipe for target 'go-mod-tidy' failed
-```
-
-If your `golang` version is `1.11.4`, you can run following cmd then `make` would pass:
-
-```
-go clean -modcache
-```
-
-If your `golang` version is below `1.11.4`, highly recommend you upgrade to `1.11.4` or above.
-
 ## Prometheus
 
 Thanos bases itself on vanilla [Prometheus](https://prometheus.io/) (v2.2.1+).
 
-Here's the Prometheus' versions Thanos is tested against:
-
-[Makefile](/Makefile#35)
+To find out the Prometheus' versions Thanos is tested against, look at the value of the `PROM_VERSIONS` variable in the [Makefile](/Makefile).
 
 ## Components
 
-Following the KISS and Unix philosophies, Thanos is made of a set of components with each filling a specific role.
+Following the [KISS](https://en.wikipedia.org/wiki/KISS_principle) and Unix philosophies, Thanos is made of a set of components with each filling a specific role.
 
 * Sidecar: connects to Prometheus and reads its data for query and/or upload it to cloud storage
 * Store Gateway: exposes the content of a cloud storage bucket
@@ -102,14 +84,14 @@ Rolling this out has little to zero impact on the running Prometheus instance. I
 
 If you are not interested in backing up any data, the `--objstore.config-file` flag can simply be omitted.
 
-* _[Example Kubernetes manifest](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar.yaml)_
-* _[Example Kubernetes manifest with Minio upload](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar-lts.yaml)_
-* _[Example Deploying sidecar using official Prometheus Helm Chart](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-helm/README.md)_
+* _[Example Kubernetes manifest](/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar.yaml)_
+* _[Example Kubernetes manifest with Minio upload](/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar-lts.yaml)_
+* _[Example Deploying sidecar using official Prometheus Helm Chart](/tutorials/kubernetes-helm/README.md)_
 * _[Details & Config for other object stores](storage.md)_
 
 #### Store API
 
-The Sidecar component implements and exposes a gRPC _[Store API](https://github.com/improbable-eng/thanos/tree/master/pkg/store/storepb/rpc.proto#L19)_. The sidecar implementation allows you to query the metric data stored in Prometheus.
+The Sidecar component implements and exposes a gRPC _[Store API](/pkg/store/storepb/rpc.proto#L19)_. The sidecar implementation allows you to query the metric data stored in Prometheus.
 
 Let's extend the Sidecar in the previous section to connect to a Prometheus server, and expose the Store API.
 
@@ -122,8 +104,8 @@ thanos sidecar \
     --grpc-address              0.0.0.0:19090              # GRPC endpoint for StoreAPI
 ```
 
-* _[Example Kubernetes manifest](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar.yaml)_
-* _[Example Kubernetes manifest with GCS upload](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar-lts.yaml)_
+* _[Example Kubernetes manifest](/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar.yaml)_
+* _[Example Kubernetes manifest with GCS upload](/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar-lts.yaml)_
 
 #### External Labels
 
@@ -188,7 +170,7 @@ thanos query \
 
 Go to the configured HTTP address, and you should now be able to query across all Prometheus instances and receive de-duplicated data.
 
-* _[Example Kubernetes manifest](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/thanos-querier.yaml)_
+* _[Example Kubernetes manifest](/tutorials/kubernetes-demo/manifests/thanos-querier.yaml)_
 
 #### Communication Between Components
 
@@ -209,8 +191,8 @@ thanos query \
 
 Read more details [here](service-discovery.md).
 
-* _[Example Kubernetes manifest](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar.yaml)_
-* _[Example Kubernetes manifest with GCS upload](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar-lts.yaml)_
+* _[Example Kubernetes manifest](/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar.yaml)_
+* _[Example Kubernetes manifest with GCS upload](/tutorials/kubernetes-demo/manifests/prometheus-ha-sidecar-lts.yaml)_
 
 ### [Store Gateway](components/store.md)
 
@@ -228,7 +210,7 @@ thanos store \
 
 The store gateway occupies small amounts of disk space for caching basic information about data in the object storage. This will rarely exceed more than a few gigabytes and is used to improve restart times. It is useful but not required to preserve it across restarts.
 
-* _[Example Kubernetes manifest](https://github.com/improbable-eng/thanos/tree/master/tutorials/kubernetes-demo/manifests/thanos-store-gateway.yaml)_
+* _[Example Kubernetes manifest](/tutorials/kubernetes-demo/manifests/thanos-store-gateway.yaml)_
 
 ### [Compactor](components/compact.md)
 
@@ -260,4 +242,4 @@ TBD
 
 Thanos also has a tutorial on deploying it to Kubernetes. We have a full page describing a standard deployment here.
 
-We also have example Grafana dashboards [here](https://github.com/improbable-eng/thanos/tree/master/examples/grafana/monitoring.md) and some [alerts](https://github.com/improbable-eng/thanos/tree/master/examples/alerts/alerts.md) to get you started.
+We also have example Grafana dashboards [here](/examples/grafana/monitoring.md) and some [alerts](/examples/alerts/alerts.md) to get you started.

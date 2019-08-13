@@ -23,19 +23,21 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/improbable-eng/thanos/pkg/runutil"
-	"github.com/improbable-eng/thanos/pkg/store/storepb"
-	"github.com/improbable-eng/thanos/pkg/tracing"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	promlabels "github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/pkg/textparse"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/tsdb/labels"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tracing"
 	yaml "gopkg.in/yaml.v2"
 )
 
-// IsWALFileAccesible returns no error if WAL dir can be found. This helps to tell
+var ErrFlagEndpointNotFound = errors.New("no flag endpoint found")
+
+// IsWALDirAccesible returns no error if WAL dir can be found. This helps to tell
 // if we have access to Prometheus TSDB directory.
 func IsWALDirAccesible(dir string) error {
 	const errMsg = "WAL dir is not accessible. Is this dir a TSDB directory? If yes it is shared with TSDB?"
@@ -66,15 +68,15 @@ func ExternalLabels(ctx context.Context, logger log.Logger, base *url.URL) (labe
 	if err != nil {
 		return nil, errors.Wrapf(err, "request flags against %s", u.String())
 	}
-	defer runutil.CloseWithLogOnErr(logger, resp.Body, "query body")
+	defer runutil.ExhaustCloseWithLogOnErr(logger, resp.Body, "query body")
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return nil, errors.Errorf("failed to read body")
+		return nil, errors.New("failed to read body")
 	}
 
 	if resp.StatusCode != 200 {
-		return nil, errors.Errorf("is 'web.enable-admin-api' flag enabled? got non-200 response code: %v, response: %v", resp.StatusCode, string(b))
+		return nil, errors.Errorf("got non-200 response code: %v, response: %v", resp.StatusCode, string(b))
 	}
 
 	var d struct {
@@ -178,29 +180,35 @@ func ConfiguredFlags(ctx context.Context, logger log.Logger, base *url.URL) (Fla
 	if err != nil {
 		return Flags{}, errors.Wrap(err, "create request")
 	}
+
 	resp, err := http.DefaultClient.Do(req.WithContext(ctx))
 	if err != nil {
 		return Flags{}, errors.Wrapf(err, "request config against %s", u.String())
 	}
-	defer runutil.CloseWithLogOnErr(logger, resp.Body, "query body")
+	defer runutil.ExhaustCloseWithLogOnErr(logger, resp.Body, "query body")
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return Flags{}, errors.Errorf("failed to read body")
+		return Flags{}, errors.New("failed to read body")
 	}
 
-	if resp.StatusCode != 200 {
+	switch resp.StatusCode {
+	case 404:
+		return Flags{}, ErrFlagEndpointNotFound
+	case 200:
+		var d struct {
+			Data Flags `json:"data"`
+		}
+
+		if err := json.Unmarshal(b, &d); err != nil {
+			return Flags{}, errors.Wrapf(err, "unmarshal response: %v", string(b))
+		}
+
+		return d.Data, nil
+	default:
 		return Flags{}, errors.Errorf("got non-200 response code: %v, response: %v", resp.StatusCode, string(b))
 	}
 
-	var d struct {
-		Data Flags `json:"data"`
-	}
-	if err := json.Unmarshal(b, &d); err != nil {
-		return Flags{}, errors.Wrapf(err, "unmarshal response: %v", string(b))
-	}
-
-	return d.Data, nil
 }
 
 // Snapshot will request Prometheus to perform snapshot in directory returned by this function.
@@ -226,15 +234,15 @@ func Snapshot(ctx context.Context, logger log.Logger, base *url.URL, skipHead bo
 	if err != nil {
 		return "", errors.Wrapf(err, "request snapshot against %s", u.String())
 	}
-	defer runutil.CloseWithLogOnErr(logger, resp.Body, "query body")
+	defer runutil.ExhaustCloseWithLogOnErr(logger, resp.Body, "query body")
 
 	b, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		return "", errors.Errorf("failed to read body")
+		return "", errors.New("failed to read body")
 	}
 
 	if resp.StatusCode != 200 {
-		return "", errors.Errorf("got non-200 response code: %v, response: %v", resp.StatusCode, string(b))
+		return "", errors.Errorf("is 'web.enable-admin-api' flag enabled? got non-200 response code: %v, response: %v", resp.StatusCode, string(b))
 	}
 
 	var d struct {
@@ -285,7 +293,7 @@ func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query s
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "perform GET request against %s", u.String())
 	}
-	defer runutil.CloseWithLogOnErr(logger, resp.Body, "query body")
+	defer runutil.ExhaustCloseWithLogOnErr(logger, resp.Body, "query body")
 
 	// Decode only ResultType and load Result only as RawJson since we don't know
 	// structure of the Result yet.
@@ -295,12 +303,19 @@ func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query s
 			Result     json.RawMessage `json:"result"`
 		} `json:"data"`
 
+		Error     string `json:"error,omitempty"`
+		ErrorType string `json:"errorType,omitempty"`
 		// Extra field supported by Thanos Querier.
 		Warnings []string `json:"warnings"`
 	}
 
-	if err = json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return nil, nil, errors.Wrap(err, "decode query instant response")
+	body, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return nil, nil, errors.Wrap(err, "read query instant response")
+	}
+
+	if err = json.Unmarshal(body, &m); err != nil {
+		return nil, nil, errors.Wrap(err, "unmarshal query instant response")
 	}
 
 	var vectorResult model.Vector
@@ -318,7 +333,14 @@ func QueryInstant(ctx context.Context, logger log.Logger, base *url.URL, query s
 			return nil, nil, errors.Wrap(err, "decode result into ValueTypeScalar")
 		}
 	default:
-		return nil, nil, errors.Errorf("unknown response type: '%q'", m.Data.ResultType)
+		if m.Warnings != nil {
+			return nil, nil, errors.Errorf("error: %s, type: %s, warning: %s", m.Error, m.ErrorType, strings.Join(m.Warnings, ", "))
+		}
+		if m.Error != "" {
+			return nil, nil, errors.Errorf("error: %s, type: %s", m.Error, m.ErrorType)
+		}
+
+		return nil, nil, errors.Errorf("received status code: %d, unknown response type: '%q'", resp.StatusCode, m.Data.ResultType)
 	}
 	return vectorResult, m.Warnings, nil
 }
@@ -406,7 +428,7 @@ func MetricValues(ctx context.Context, logger log.Logger, base *url.URL, perMetr
 	if err != nil {
 		return errors.Wrapf(err, "perform GET request against %s", u.String())
 	}
-	defer runutil.CloseWithLogOnErr(logger, resp.Body, "metrics body")
+	defer runutil.ExhaustCloseWithLogOnErr(logger, resp.Body, "metrics body")
 
 	if resp.StatusCode != http.StatusOK {
 		return errors.Errorf("server returned HTTP status %s", resp.Status)

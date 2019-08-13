@@ -1,6 +1,8 @@
+.envrc
+
 /prometheus
 /thanos
-vendor/
+/vendor/
 
 # Ignore minikube setup working dirs.
 kube/bin
@@ -20,4 +22,4 @@ data/
 
 website/public/
 website/docs-pre-processed/
-website/hugo-generated.yaml
+!website/data

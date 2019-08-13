@@ -9,11 +9,11 @@ import (
 	"time"
 
 	"github.com/go-kit/kit/log"
-	"github.com/improbable-eng/thanos/pkg/promclient"
-	"github.com/improbable-eng/thanos/pkg/runutil"
-	"github.com/improbable-eng/thanos/pkg/testutil"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
+	"github.com/thanos-io/thanos/pkg/promclient"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 type testConfig struct {
@@ -22,8 +22,7 @@ type testConfig struct {
 }
 
 var (
-	firstPromPort       = promHTTPPort(1)
-	remoteWriteEndpoint = fmt.Sprintf("http://%s/api/v1/receive", remoteWriteReceiveHTTP(1))
+	firstPromPort = promHTTPPort(1)
 
 	queryStaticFlagsSuite = newSpinupSuite().
 				Add(scraper(1, defaultPromConfig("prom-"+firstPromPort, 0))).
@@ -31,7 +30,7 @@ var (
 				Add(scraper(3, defaultPromConfig("prom-ha", 1))).
 				Add(querierWithStoreFlags(1, "replica", sidecarGRPC(1), sidecarGRPC(2), sidecarGRPC(3), remoteWriteReceiveGRPC(1))).
 				Add(querierWithStoreFlags(2, "replica", sidecarGRPC(1), sidecarGRPC(2), sidecarGRPC(3), remoteWriteReceiveGRPC(1))).
-				Add(receiver(1, defaultPromRemoteWriteConfig(remoteWriteEndpoint)))
+				Add(receiver(1, defaultPromRemoteWriteConfig(nodeExporterHTTP(1), remoteWriteEndpoint(1)), 1))
 
 	queryFileSDSuite = newSpinupSuite().
 				Add(scraper(1, defaultPromConfig("prom-"+firstPromPort, 0))).
@@ -39,7 +38,7 @@ var (
 				Add(scraper(3, defaultPromConfig("prom-ha", 1))).
 				Add(querierWithFileSD(1, "replica", sidecarGRPC(1), sidecarGRPC(2), sidecarGRPC(3), remoteWriteReceiveGRPC(1))).
 				Add(querierWithFileSD(2, "replica", sidecarGRPC(1), sidecarGRPC(2), sidecarGRPC(3), remoteWriteReceiveGRPC(1))).
-				Add(receiver(1, defaultPromRemoteWriteConfig(remoteWriteEndpoint)))
+				Add(receiver(1, defaultPromRemoteWriteConfig(nodeExporterHTTP(1), remoteWriteEndpoint(1)), 1))
 )
 
 func TestQuery(t *testing.T) {
@@ -108,9 +107,6 @@ func testQuerySimple(t *testing.T, conf testConfig) {
 		}
 
 		expectedRes := 4
-		if conf.name == "gossip" {
-			expectedRes = 3
-		}
 		if len(res) != expectedRes {
 			return errors.Errorf("unexpected result size %d, expected %d", len(res), expectedRes)
 		}
@@ -140,13 +136,13 @@ func testQuerySimple(t *testing.T, conf testConfig) {
 		"replica":    model.LabelValue("1"),
 	}, res[2].Metric)
 
-	if conf.name != "gossip" {
-		testutil.Equals(t, model.Metric{
-			"__name__": "up",
-			"instance": model.LabelValue("localhost:9100"),
-			"job":      "node",
-		}, res[3].Metric)
-	}
+	testutil.Equals(t, model.Metric{
+		"__name__": "up",
+		"instance": model.LabelValue(nodeExporterHTTP(1)),
+		"job":      "node",
+		"receive":  "true",
+		"replica":  model.LabelValue("1"),
+	}, res[3].Metric)
 
 	// Try query with deduplication.
 	testutil.Ok(t, runutil.Retry(time.Second, ctx.Done(), func() error {
@@ -174,9 +170,6 @@ func testQuerySimple(t *testing.T, conf testConfig) {
 		}
 
 		expectedRes := 3
-		if conf.name == "gossip" {
-			expectedRes = 2
-		}
 		if len(res) != expectedRes {
 			return errors.Errorf("unexpected result size %d, expected %d", len(res), expectedRes)
 		}
@@ -196,13 +189,12 @@ func testQuerySimple(t *testing.T, conf testConfig) {
 		"job":        "prometheus",
 		"prometheus": "prom-ha",
 	}, res[1].Metric)
-	if conf.name != "gossip" {
-		testutil.Equals(t, model.Metric{
-			"__name__": "up",
-			"instance": model.LabelValue("localhost:9100"),
-			"job":      "node",
-		}, res[2].Metric)
-	}
+	testutil.Equals(t, model.Metric{
+		"__name__": "up",
+		"instance": model.LabelValue(nodeExporterHTTP(1)),
+		"job":      "node",
+		"receive":  "true",
+	}, res[2].Metric)
 }
 
 func urlParse(t *testing.T, addr string) *url.URL {
@@ -227,13 +219,13 @@ scrape_configs:
 `, name, replicas, firstPromPort)
 }
 
-func defaultPromRemoteWriteConfig(remoteWriteEndpoint string) string {
+func defaultPromRemoteWriteConfig(nodeExporterHTTP, remoteWriteEndpoint string) string {
 	return fmt.Sprintf(`
 scrape_configs:
 - job_name: 'node'
   static_configs:
-  - targets: ['localhost:9100']
+  - targets: ['%s']
 remote_write:
 - url: "%s"
-`, remoteWriteEndpoint)
+`, nodeExporterHTTP, remoteWriteEndpoint)
 }

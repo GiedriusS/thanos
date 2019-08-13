@@ -2,15 +2,16 @@ package verifier
 
 import (
 	"context"
+	"sort"
+
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/improbable-eng/thanos/pkg/block"
-	"github.com/improbable-eng/thanos/pkg/compact"
-	"github.com/improbable-eng/thanos/pkg/objstore"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/tsdb"
-	"sort"
+	"github.com/thanos-io/thanos/pkg/block"
+	"github.com/thanos-io/thanos/pkg/compact"
+	"github.com/thanos-io/thanos/pkg/objstore"
 )
 
 const OverlappedBlocksIssueID = "overlapped_blocks"

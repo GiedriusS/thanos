@@ -27,15 +27,15 @@ Adding large new features and components to Thanos should be done by first creat
 
 ## Pull Request Process
 
-1. Read [getting started docs](docs/getting_started.md) and prepare Thanos.
+1. Read [getting started docs](docs/getting-started.md) and prepare Thanos.
 2. Familiarize yourself with [Makefile](Makefile) commands like `format`, `build`, `proto` and `test`.
-3. Fork improbable-eng/thanos.git and start development from your own fork. Here are sample steps to setup your development environment:
+3. Fork thanos-io/thanos.git and start development from your own fork. Here are sample steps to setup your development environment:
 ```console
-$ mkdir -p $GOPATH/src/github.com/improbable-eng
-$ cd $GOPATH/src/github.com/improbable-eng
+$ mkdir -p $GOPATH/src/github.com/thanos-io
+$ cd $GOPATH/src/github.com/thanos-io
 $ git clone https://github.com/<your_github_id>/thanos.git
 $ cd thanos
-$ git remote add upstream https://github.com/improbable-eng/thanos.git
+$ git remote add upstream https://github.com/thanos-io/thanos.git
 $ git remote update
 $ git merge upstream/master
 $ make build
@@ -64,11 +64,11 @@ CI runs GCS and inmem tests only for now. Not having these variables will produc
 6. If your change affects users (adds or removes feature) consider adding the item to [CHANGELOG](CHANGELOG.md)
 7. You may merge the Pull Request in once you have the sign-off of at least one developers with write access, or if you
    do not have permission to do that, you may request the second reviewer to merge it for you.
-8. If you feel like your PR waits too long for a review, feel free to ping [`#thanos-dev`](https://join.slack.com/t/improbable-eng/shared_invite/enQtMzQ1ODcyMzQ5MjM4LWY5ZWZmNGM2ODc5MmViNmQ3ZTA3ZTY3NzQwOTBlMTkzZmIxZTIxODk0OWU3YjZhNWVlNDU3MDlkZGViZjhkMjc) channel on our slack for review!
+8. If you feel like your PR waits too long for a review, feel free to ping [`#thanos-prs`](https://slack.cncf.io/) channel on our slack for review!
 
 ## Dependency management
 
-The Thanos project uses [Go modules](https://golang.org/cmd/go/#hdr-Modules__module_versions__and_more) to manage dependencies on external packages. This requires a working Go environment with version 1.11 or greater, git and [bzr](http://wiki.bazaar.canonical.com/Download) installed.
+The Thanos project uses [Go modules](https://golang.org/cmd/go/#hdr-Modules__module_versions__and_more) to manage dependencies on external packages. This requires a working Go environment with version 1.11 or greater and git installed.
 
 To add or update a new dependency, use the `go get` command:
 

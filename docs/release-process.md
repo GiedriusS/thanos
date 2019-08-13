@@ -1,27 +1,61 @@
-# For maintainers: Releases
+---
+title: Release Process
+type: docs
+menu: thanos
+slug: /release-process.md
+---
 
-This page describes the release process for Thanos project.
+This page describes the release cadence and process for Thanos project.
+
+We use [Semantic Versioning](http://semver.org/).
 
 NOTE: As [Semantic Versioning](http://semver.org/spec/v2.0.0.html) states all 0.y.z releases can contain breaking changes in API (flags, grpc API, any backward compatibility)
 
 ## Cadence
 
-We aim for *at least* 1 release per 6 weeks. However, no strict dates are planned.
+We aim for regular and strict one release per *6 weeks*. 6 weeks is counter from first release candidate to another. 
+This means that there is no *code freeze* or anything like that. We plan to stick to the exact 6 weeks, so there is no rush
+into being within release (except bug fixes).
 
-No release candidates are required until major version.
+No feature should block release.
 
-Additionally we aim for `master` branch being stable.
+Additionally we (obviously) aim for `master` branch being stable.
 
-## Cutting individual release
+We are assigning a release shepherd for each minor release. 
 
-Process of cutting a new *minor* Thanos release:
+Release shepherd responsibilities:
+
+* Perform releases (from first RC to actual release).
+* Announce all releases on all communication channels.
+
+
+| Release   | Time of first RC         | Shepherd (Github handle) |
+|-----------|--------------------------|--------------------------|
+| v0.7.0    | (planned) 23.08.2019     | TBC                      |
+| v0.6.0    | (planned) 12.07.2019     | `@GiedriusS`             |
+| v0.5.0    | 31.06.2019               | `@bwplotka`              |
+
+# For maintainers: Cutting individual release 
+
+Process of releasing a *minor* Thanos version:
+1. Release `v<major>.<minor+1>.0-rc.0`
+1. If after 3 work days there is no major bug, release `v<major>.<minor>.0`
+1. If within 3 work days there is major bug, let's triage it to fix it and then release `v<major>.<minor>.0-rc.++` Go to step 2.
+1. Do patch release if needed for any bugs afterwards. Use same `release-xxx` branch.
+
+## How to release a version
 
 1. Add PR on branch `release-<major>.<minor>` that will start minor release branch and prepare changes to cut release.
-1. Bump [VERSION file](/VERSION)
+    
+  For release candidate just reuse same branch and rebase it on every candidate until the actual release happens.
+        
 1. Update [CHANGELOG file](/CHANGELOG.md)
 
   Note that `CHANGELOG.md` should only document changes relevant to users of Thanos, including external API changes, performance improvements, and new features. Do not document changes of internal interfaces, code refactorings and clean-ups, changes to the build process, etc. People interested in these are asked to refer to the git history.
   Format is described in `CHANGELOG.md`.
+  
+  The whole release from release candidate `rc.0` to actual release should have exactly the same section. We don't separate
+  what have changed between release candidates.
 
 1. Double check backward compatibility:
     1. *In case of version after `v1+.y.z`*, double check if none of the changes break API compatibility. This should be done in PR review process, but double check is good to have.
@@ -30,7 +64,7 @@ Process of cutting a new *minor* Thanos release:
 1. After review, merge the PR and immediately after this tag a version:
 
     ```bash
-    $ tag=$(< VERSION)
+    $ tag=x.y.z
     $ git tag -s "v${tag}" -m "v${tag}"
     $ git push origin "v${tag}"
     ```
@@ -46,15 +80,6 @@ Process of cutting a new *minor* Thanos release:
  1. Once tarballs are published on release page, you can click `Publish` and release is complete.
 
  1. Announce `#thanos` slack channel.
-
-1. After release create a second PR adding `-master` [VERSION file](/VERSION) suffix to the end of version. This will ensure master built images will have different version then released one.
-
-## Branch management and versioning strategy
-
-We use [Semantic Versioning](http://semver.org/).
-
-NOTE: We have a separate branch for each minor release, named `release-<major>.<minor>`, e.g. `release-0.1`, `release-0.2`. but they are
-*NOT* maintained as we don't have major version yet.
 
 ## Pre-releases (release candidates)
 

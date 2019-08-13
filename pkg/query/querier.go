@@ -6,13 +6,14 @@ import (
 	"strings"
 
 	"github.com/go-kit/kit/log"
-	"github.com/improbable-eng/thanos/pkg/store/storepb"
-	"github.com/improbable-eng/thanos/pkg/tracing"
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
+<<<<<<< HEAD
 type selectOnlyQuerier struct {
 	ctx          context.Context
 	logger       log.Logger
@@ -25,12 +26,62 @@ type selectOnlyQuerier struct {
 }
 
 // newSelectOnlyQuerier creates implementation of storage.Querier.Select method that fetches data from the proxy
+=======
+// QueryableCreator returns implementation of promql.Queryable that fetches data from the proxy store API endpoints.
+// If deduplication is enabled, all data retrieved from it will be deduplicated along the replicaLabel by default.
+// maxResolutionMillis controls downsampling resolution that is allowed (specified in milliseconds).
+// partialResponse controls `partialResponseDisabled` option of StoreAPI and partial response behaviour of proxy.
+type QueryableCreator func(deduplicate bool, maxResolutionMillis int64, partialResponse bool) storage.Queryable
+
+// NewQueryableCreator creates QueryableCreator.
+func NewQueryableCreator(logger log.Logger, proxy storepb.StoreServer, replicaLabel string) QueryableCreator {
+	return func(deduplicate bool, maxResolutionMillis int64, partialResponse bool) storage.Queryable {
+		return &queryable{
+			logger:              logger,
+			replicaLabel:        replicaLabel,
+			proxy:               proxy,
+			deduplicate:         deduplicate,
+			maxResolutionMillis: maxResolutionMillis,
+			partialResponse:     partialResponse,
+		}
+	}
+}
+
+type queryable struct {
+	logger              log.Logger
+	replicaLabel        string
+	proxy               storepb.StoreServer
+	deduplicate         bool
+	maxResolutionMillis int64
+	partialResponse     bool
+}
+
+// Querier returns a new storage querier against the underlying proxy store API.
+func (q *queryable) Querier(ctx context.Context, mint, maxt int64) (storage.Querier, error) {
+	return newQuerier(ctx, q.logger, mint, maxt, q.replicaLabel, q.proxy, q.deduplicate, int64(q.maxResolutionMillis), q.partialResponse), nil
+}
+
+type querier struct {
+	ctx                 context.Context
+	logger              log.Logger
+	cancel              func()
+	mint, maxt          int64
+	replicaLabel        string
+	proxy               storepb.StoreServer
+	deduplicate         bool
+	maxResolutionMillis int64
+	partialResponse     bool
+}
+
+// newQuerier creates implementation of storage.Querier that fetches data from the proxy
+>>>>>>> origin
 // store API endpoints.
 func newSelectOnlyQuerier(
 	ctx context.Context,
 	mint, maxt int64,
 	replicaLabel string,
 	proxy storepb.StoreServer,
+<<<<<<< HEAD
 	warningReporter warningReporter,
 	opts Options,
 ) *selectOnlyQuerier {
@@ -44,6 +95,27 @@ func newSelectOnlyQuerier(
 		proxy:        proxy,
 		opts:         opts,
 		warningReporter: warningReporter,
+=======
+	deduplicate bool,
+	maxResolutionMillis int64,
+	partialResponse bool,
+) *querier {
+	if logger == nil {
+		logger = log.NewNopLogger()
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	return &querier{
+		ctx:                 ctx,
+		logger:              logger,
+		cancel:              cancel,
+		mint:                mint,
+		maxt:                maxt,
+		replicaLabel:        replicaLabel,
+		proxy:               proxy,
+		deduplicate:         deduplicate,
+		maxResolutionMillis: maxResolutionMillis,
+		partialResponse:     partialResponse,
+>>>>>>> origin
 	}
 }
 
@@ -110,7 +182,8 @@ func aggrsFromFunc(f string) ([]storepb.Aggr, resAggr) {
 	if f == "count" || strings.HasPrefix(f, "count_") {
 		return []storepb.Aggr{storepb.Aggr_COUNT}, resAggrCount
 	}
-	if f == "sum" || strings.HasPrefix(f, "sum_") {
+	// f == "sum" falls through here since we want the actual samples
+	if strings.HasPrefix(f, "sum_") {
 		return []storepb.Aggr{storepb.Aggr_SUM}, resAggrSum
 	}
 	if f == "increase" || f == "rate" {
@@ -157,7 +230,7 @@ func (q *selectOnlyQuerier) Select(params *storage.SelectParams, ms ...*labels.M
 			maxt: q.maxt,
 			set:  NewStoreSeriesSet(ss),
 			aggr: resAggr,
-		}, nil, nil
+		}, warns, nil
 	}
 
 	// TODO(fabxc): this could potentially pushed further down into the store API
@@ -174,7 +247,7 @@ func (q *selectOnlyQuerier) Select(params *storage.SelectParams, ms ...*labels.M
 	// The merged series set assembles all potentially-overlapping time ranges
 	// of the same series into a single one. The series are ordered so that equal series
 	// from different replicas are sequential. We can now deduplicate those.
-	return newDedupSeriesSet(set, q.replicaLabel), nil, nil
+	return newDedupSeriesSet(set, q.replicaLabel), warns, nil
 }
 
 // sortDedupLabels resorts the set so that the same series with different replica

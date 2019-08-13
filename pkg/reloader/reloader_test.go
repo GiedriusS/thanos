@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"github.com/fortytw2/leaktest"
-	"github.com/improbable-eng/thanos/pkg/testutil"
+	"github.com/thanos-io/thanos/pkg/testutil"
 )
 
 func TestReloader_ConfigApply(t *testing.T) {
@@ -139,6 +139,7 @@ config:
 		}
 	}()
 	err = reloader.Watch(ctx)
+	testutil.Ok(t, err)
 	cancel()
 	g.Wait()
 	testutil.Equals(t, 2, reloads.Load().(int))

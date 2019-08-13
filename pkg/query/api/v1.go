@@ -40,24 +40,29 @@ import (
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/pkg/timestamp"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/storage"
+	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/query"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
 type status string
 
 const (
 	statusSuccess status = "success"
-	statusError          = "error"
+	statusError   status = "error"
 )
 
 type ErrorType string
 
 const (
 	errorNone     ErrorType = ""
-	errorTimeout            = "timeout"
-	errorCanceled           = "canceled"
-	errorExec               = "execution"
-	errorBadData            = "bad_data"
-	ErrorInternal           = "internal"
+	errorTimeout  ErrorType = "timeout"
+	errorCanceled ErrorType = "canceled"
+	errorExec     ErrorType = "execution"
+	errorBadData  ErrorType = "bad_data"
+	ErrorInternal ErrorType = "internal"
 )
 
 var corsHeaders = map[string]string{
@@ -79,7 +84,7 @@ func (e *ApiError) Error() string {
 type response struct {
 	Status    status      `json:"status"`
 	Data      interface{} `json:"data,omitempty"`
-	ErrorType ErrorType   `json:"ErrorType,omitempty"`
+	ErrorType ErrorType   `json:"errorType,omitempty"`
 	Error     string      `json:"error,omitempty"`
 	Warnings  []string    `json:"warnings,omitempty"`
 }
@@ -169,7 +174,7 @@ func NewAPI(
 }
 
 // Register the API's endpoints in the given router.
-func (api *API) Register(r *route.Router, tracer opentracing.Tracer) {
+func (api *API) Register(r *route.Router, tracer opentracing.Tracer, logger log.Logger, ins extpromhttp.InstrumentationMiddleware) {
 	instr := func(name string, f ApiFunc) http.HandlerFunc {
 		hf := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			SetCORS(w)
@@ -181,7 +186,7 @@ func (api *API) Register(r *route.Router, tracer opentracing.Tracer) {
 				w.WriteHeader(http.StatusNoContent)
 			}
 		})
-		return prometheus.InstrumentHandler(name, tracing.HTTPMiddleware(tracer, name, api.logger, gziphandler.GzipHandler(hf)))
+		return ins.NewHandler(name, tracing.HTTPMiddleware(tracer, name, logger, gziphandler.GzipHandler(hf)))
 	}
 
 	r.Options("/*path", instr("options", api.options))
@@ -195,6 +200,9 @@ func (api *API) Register(r *route.Router, tracer opentracing.Tracer) {
 
 	r.Get("/query_range", instr("query_range", api.queryRange))
 	r.Post("/query_range", instr("query_range", api.queryRange))
+	r.Post("/series", instr("series", api.series))
+
+	r.Get("/labels", instr("label_names", api.labelNames))
 }
 
 type queryData struct {
@@ -203,6 +211,57 @@ type queryData struct {
 
 	// Additional Thanos Response field.
 	Warnings []error `json:"warnings,omitempty"`
+}
+
+func (api *API) parseEnableDedupParam(r *http.Request) (enableDeduplication bool, _ *ApiError) {
+	const dedupParam = "dedup"
+	enableDeduplication = true
+
+	if val := r.FormValue(dedupParam); val != "" {
+		var err error
+		enableDeduplication, err = strconv.ParseBool(val)
+		if err != nil {
+			return false, &ApiError{errorBadData, errors.Wrapf(err, "'%s' parameter", dedupParam)}
+		}
+	}
+	return enableDeduplication, nil
+}
+
+func (api *API) parseDownsamplingParamMillis(r *http.Request, step time.Duration) (maxResolutionMillis int64, _ *ApiError) {
+	const maxSourceResolutionParam = "max_source_resolution"
+	maxSourceResolution := 0 * time.Second
+
+	if api.enableAutodownsampling {
+		// If no max_source_resolution is specified fit at least 5 samples between steps.
+		maxSourceResolution = step / 5
+	}
+	if val := r.FormValue(maxSourceResolutionParam); val != "" {
+		var err error
+		maxSourceResolution, err = parseDuration(val)
+		if err != nil {
+			return 0, &ApiError{errorBadData, errors.Wrapf(err, "'%s' parameter", maxSourceResolutionParam)}
+		}
+	}
+
+	if maxSourceResolution < 0 {
+		return 0, &ApiError{errorBadData, errors.Errorf("negative '%s' is not accepted. Try a positive integer", maxSourceResolutionParam)}
+	}
+
+	return int64(maxSourceResolution / time.Millisecond), nil
+}
+
+func (api *API) parsePartialResponseParam(r *http.Request) (enablePartialResponse bool, _ *ApiError) {
+	const partialResponseParam = "partial_response"
+	enablePartialResponse = api.enablePartialResponse
+
+	if val := r.FormValue(partialResponseParam); val != "" {
+		var err error
+		enablePartialResponse, err = strconv.ParseBool(val)
+		if err != nil {
+			return false, &ApiError{errorBadData, errors.Wrapf(err, "'%s' parameter", partialResponseParam)}
+		}
+	}
+	return enablePartialResponse, nil
 }
 
 func (api *API) options(r *http.Request) (interface{}, []error, *ApiError) {
@@ -556,4 +615,26 @@ func parseDuration(s string) (time.Duration, error) {
 		return time.Duration(d), nil
 	}
 	return 0, fmt.Errorf("cannot parse %q to a valid duration", s)
+}
+
+func (api *API) labelNames(r *http.Request) (interface{}, []error, *ApiError) {
+	ctx := r.Context()
+
+	enablePartialResponse, apiErr := api.parsePartialResponseParam(r)
+	if apiErr != nil {
+		return nil, nil, apiErr
+	}
+
+	q, err := api.queryableCreate(true, 0, enablePartialResponse).Querier(ctx, math.MinInt64, math.MaxInt64)
+	if err != nil {
+		return nil, nil, &ApiError{errorExec, err}
+	}
+	defer runutil.CloseWithLogOnErr(api.logger, q, "queryable labelNames")
+
+	names, warnings, err := q.LabelNames()
+	if err != nil {
+		return nil, nil, &ApiError{errorExec, err}
+	}
+
+	return names, warnings, nil
 }

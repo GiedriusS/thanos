@@ -8,8 +8,8 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/improbable-eng/thanos/pkg/discovery/dns/miekgdns"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/thanos-io/thanos/pkg/discovery/dns/miekgdns"
 )
 
 // Provider is a stateful cache for asynchronous DNS resolutions. It provides a way to resolve addresses and obtain them.
@@ -20,6 +20,7 @@ type Provider struct {
 	resolved map[string][]string
 	logger   log.Logger
 
+	resolverAddrs         *prometheus.GaugeVec
 	resolverLookupsCount  prometheus.Counter
 	resolverFailuresCount prometheus.Counter
 }
@@ -52,6 +53,10 @@ func NewProvider(logger log.Logger, reg prometheus.Registerer, resolverType Reso
 		resolver: NewResolver(resolverType.ToResolver(logger)),
 		resolved: make(map[string][]string),
 		logger:   logger,
+		resolverAddrs: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "dns_provider_results",
+			Help: "The number of resolved endpoints for each configured address",
+		}, []string{"addr"}),
 		resolverLookupsCount: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "dns_lookups_total",
 			Help: "The number of DNS lookups resolutions attempts",
@@ -63,6 +68,7 @@ func NewProvider(logger log.Logger, reg prometheus.Registerer, resolverType Reso
 	}
 
 	if reg != nil {
+		reg.MustRegister(p.resolverAddrs)
 		reg.MustRegister(p.resolverLookupsCount)
 		reg.MustRegister(p.resolverFailuresCount)
 	}
@@ -99,14 +105,13 @@ func (p *Provider) Resolve(ctx context.Context, addrs []string) {
 	}
 
 	// Remove stored addresses that are no longer requested.
-	var entriesToDelete []string
 	for existingAddr := range p.resolved {
 		if !contains(addrs, existingAddr) {
-			entriesToDelete = append(entriesToDelete, existingAddr)
+			delete(p.resolved, existingAddr)
+			p.resolverAddrs.DeleteLabelValues(existingAddr)
+		} else {
+			p.resolverAddrs.WithLabelValues(existingAddr).Set(float64(len(p.resolved[existingAddr])))
 		}
-	}
-	for _, toDelete := range entriesToDelete {
-		delete(p.resolved, toDelete)
 	}
 }
 

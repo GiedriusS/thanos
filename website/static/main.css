@@ -50,3 +50,24 @@ pre {
 .list-group-item-thanos:hover {
     color: #6D41FF;
 }
+
+.img-adopter {
+    padding: 25px;
+    background-color: #fff;
+    box-shadow: 0 2px 4px rgba(0,0,0,.1);
+    border: 1px solid #dee2e6;
+    margin: 15px 0 15px;
+    border-radius: .25rem;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    height: 100px;
+}
+
+.img-adopter img {
+    max-width: 100%;
+    max-height: 100%;
+}
+
+.header-anchor { font-size: 100%; visibility: hidden;}
+h1:hover a, h2:hover a, h3:hover a, h4:hover a { visibility: visible}

@@ -39,6 +39,18 @@ import (
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/tsdb/labels"
+	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/discovery/cache"
+	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	"github.com/thanos-io/thanos/pkg/extprom"
+	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/query"
+	v1 "github.com/thanos-io/thanos/pkg/query/api"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tracing"
+	"github.com/thanos-io/thanos/pkg/ui"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
@@ -48,10 +60,7 @@ import (
 func registerQuery(m map[string]setupFunc, app *kingpin.Application, name string) {
 	cmd := app.Command(name, "query node exposing PromQL enabled Query API with data retrieved from multiple store nodes")
 
-	grpcBindAddr, httpBindAddr, srvCert, srvKey, srvClientCA, newPeerFn := regCommonServerFlags(cmd)
-
-	httpAdvertiseAddr := cmd.Flag("http-advertise-address", "Explicit (external) host:port address to advertise for HTTP QueryAPI in gossip cluster. If empty, 'http-address' will be used.").
-		String()
+	grpcBindAddr, httpBindAddr, srvCert, srvKey, srvClientCA := regCommonServerFlags(cmd)
 
 	secure := cmd.Flag("grpc-client-tls-secure", "Use TLS when talking to the gRPC server").Default("false").Bool()
 	cert := cmd.Flag("grpc-client-tls-cert", "TLS Certificates to use to identify this client to the server").Default("").String()
@@ -106,10 +115,6 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application, name string
 	storeResponseTimeout := modelDuration(cmd.Flag("store.response-timeout", "If a Store doesn't send any data in this specified duration then a Store will be ignored and partial data will be returned if it's enabled. 0 disables timeout.").Default("0ms"))
 
 	m[name] = func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ bool) error {
-		peer, err := newPeerFn(logger, reg, true, *httpAdvertiseAddr, true)
-		if err != nil {
-			return errors.Wrap(err, "new cluster peer")
-		}
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
 			return errors.Wrap(err, "parse federation labels")
@@ -157,7 +162,6 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application, name string
 			time.Duration(*queryTimeout),
 			time.Duration(*storeResponseTimeout),
 			*replicaLabel,
-			peer,
 			selectorLset,
 			*stores,
 			*enableAutodownsampling,
@@ -290,7 +294,6 @@ func runQuery(
 	queryTimeout time.Duration,
 	storeResponseTimeout time.Duration,
 	replicaLabel string,
-	peer cluster.Peer,
 	selectorLset labels.Labels,
 	storeAddrs []string,
 	enableAutodownsampling bool,
@@ -325,16 +328,6 @@ func runQuery(
 			logger,
 			reg,
 			func() (specs []query.StoreSpec) {
-				// Add store specs from gossip.
-				for id, ps := range peer.PeerStates(cluster.PeerTypesStoreAPIs()...) {
-					if ps.StoreAPIAddr == "" {
-						level.Error(logger).Log("msg", "Gossip found peer that propagates empty address, ignoring.", "lset", fmt.Sprintf("%v", ps.Metadata.Labels))
-						continue
-					}
-
-					specs = append(specs, &gossipSpec{id: id, addr: ps.StoreAPIAddr, stateFetcher: peer})
-				}
-
 				// Add DNS resolved addresses from static flags and file SD.
 				for _, addr := range dnsProvider.Addresses() {
 					specs = append(specs, query.NewGRPCStoreSpec(addr))
@@ -353,7 +346,7 @@ func runQuery(
 				Logger:        logger,
 				Reg:           reg,
 				MaxConcurrent: maxConcurrentQueries,
-				// TODO(bwplotka): Expose this as a flag: https://github.com/improbable-eng/thanos/issues/703
+				// TODO(bwplotka): Expose this as a flag: https://github.com/thanos-io/thanos/issues/703
 				MaxSamples: math.MaxInt32,
 				Timeout:    queryTimeout,
 			},
@@ -407,21 +400,6 @@ func runQuery(
 			close(fileSDUpdates)
 		})
 	}
-	{
-		ctx, cancel := context.WithCancel(context.Background())
-		g.Add(func() error {
-			// New gossip cluster.
-			if err := peer.Join(cluster.PeerTypeQuery, cluster.PeerMetadata{}); err != nil {
-				return errors.Wrap(err, "join cluster")
-			}
-
-			<-ctx.Done()
-			return nil
-		}, func(error) {
-			cancel()
-			peer.Close(5 * time.Second)
-		})
-	}
 	// Periodically update the addresses from static flags and file SD by resolving them using DNS SD if necessary.
 	{
 		ctx, cancel := context.WithCancel(context.Background())
@@ -451,7 +429,9 @@ func runQuery(
 			"web.prefix-header":   webPrefixHeaderName,
 		}
 
-		ui.NewQueryUI(logger, stores, flagsMap).Register(router.WithPrefix(webRoutePrefix))
+		ins := extpromhttp.NewInstrumentationMiddleware(reg)
+
+		ui.NewQueryUI(logger, stores, flagsMap).Register(router.WithPrefix(webRoutePrefix), ins)
 
 		partialResponseStrategy := storepb.PartialResponseStrategy_ABORT
 		if enablePartialResponse {
@@ -497,7 +477,7 @@ func runQuery(
 			extraMiddlewares...,
 		)
 
-		api.Register(router.WithPrefix(path.Join(webRoutePrefix, "/api/v1")), tracer)
+		api.Register(router.WithPrefix(path.Join(webRoutePrefix, "/api/v1")), tracer, logger, ins)
 
 		router.Get("/-/healthy", func(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
@@ -544,7 +524,6 @@ func runQuery(
 			return errors.Wrap(s.Serve(l), "serve gRPC")
 		}, func(error) {
 			s.Stop()
-			runutil.CloseWithLogOnErr(logger, l, "store gRPC listener")
 		})
 	}
 
@@ -567,24 +546,4 @@ func removeDuplicateStoreSpecs(logger log.Logger, duplicatedStores prometheus.Co
 		deduplicated = append(deduplicated, value)
 	}
 	return deduplicated
-}
-
-type gossipSpec struct {
-	id   string
-	addr string
-
-	stateFetcher cluster.PeerStateFetcher
-}
-
-func (s *gossipSpec) Addr() string {
-	return s.addr
-}
-
-// Metadata method for gossip store tries get current peer state.
-func (s *gossipSpec) Metadata(_ context.Context, _ storepb.StoreClient) (labels []storepb.Label, mint int64, maxt int64, err error) {
-	state, ok := s.stateFetcher.PeerState(s.id)
-	if !ok {
-		return nil, 0, 0, errors.Errorf("peer %s is no longer in gossip cluster", s.id)
-	}
-	return state.Metadata.Labels, state.Metadata.MinTime, state.Metadata.MaxTime, nil
 }

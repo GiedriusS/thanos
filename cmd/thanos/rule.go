@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -12,7 +11,6 @@ import (
 	"os/signal"
 	"path"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,23 +19,6 @@ import (
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/improbable-eng/thanos/pkg/alert"
-	"github.com/improbable-eng/thanos/pkg/block/metadata"
-	"github.com/improbable-eng/thanos/pkg/cluster"
-	"github.com/improbable-eng/thanos/pkg/component"
-	"github.com/improbable-eng/thanos/pkg/discovery/cache"
-	"github.com/improbable-eng/thanos/pkg/discovery/dns"
-	"github.com/improbable-eng/thanos/pkg/extprom"
-	"github.com/improbable-eng/thanos/pkg/objstore/client"
-	"github.com/improbable-eng/thanos/pkg/promclient"
-	thanosrule "github.com/improbable-eng/thanos/pkg/rule"
-	v1 "github.com/improbable-eng/thanos/pkg/rule/api"
-	"github.com/improbable-eng/thanos/pkg/runutil"
-	"github.com/improbable-eng/thanos/pkg/shipper"
-	"github.com/improbable-eng/thanos/pkg/store"
-	"github.com/improbable-eng/thanos/pkg/store/storepb"
-	"github.com/improbable-eng/thanos/pkg/tracing"
-	"github.com/improbable-eng/thanos/pkg/ui"
 	"github.com/oklog/run"
 	opentracing "github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
@@ -52,6 +33,23 @@ import (
 	"github.com/prometheus/prometheus/storage/tsdb"
 	"github.com/prometheus/prometheus/util/strutil"
 	"github.com/prometheus/tsdb/labels"
+	"github.com/thanos-io/thanos/pkg/alert"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/component"
+	"github.com/thanos-io/thanos/pkg/discovery/cache"
+	"github.com/thanos-io/thanos/pkg/discovery/dns"
+	"github.com/thanos-io/thanos/pkg/extprom"
+	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/objstore/client"
+	"github.com/thanos-io/thanos/pkg/promclient"
+	thanosrule "github.com/thanos-io/thanos/pkg/rule"
+	v1 "github.com/thanos-io/thanos/pkg/rule/api"
+	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/shipper"
+	"github.com/thanos-io/thanos/pkg/store"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
+	"github.com/thanos-io/thanos/pkg/tracing"
+	"github.com/thanos-io/thanos/pkg/ui"
 	"google.golang.org/grpc"
 	kingpin "gopkg.in/alecthomas/kingpin.v2"
 )
@@ -60,7 +58,7 @@ import (
 func registerRule(m map[string]setupFunc, app *kingpin.Application, name string) {
 	cmd := app.Command(name, "ruler evaluating Prometheus rules against given Query nodes, exposing Store API and storing old blocks in bucket")
 
-	grpcBindAddr, httpBindAddr, cert, key, clientCA, newPeerFn := regCommonServerFlags(cmd)
+	grpcBindAddr, httpBindAddr, cert, key, clientCA := regCommonServerFlags(cmd)
 
 	labelStrs := cmd.Flag("label", "Labels to be applied to all generated metrics (repeated). Similar to external labels for Prometheus, used to identify ruler and its blocks as unique source.").
 		PlaceHolder("<name>=\"<value>\"").Strings()
@@ -112,20 +110,16 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 		if err != nil {
 			return errors.Wrap(err, "parse labels")
 		}
-		peer, err := newPeerFn(logger, reg, false, "", false)
-		if err != nil {
-			return errors.Wrap(err, "new cluster peer")
-		}
 		alertQueryURL, err := url.Parse(*alertQueryURL)
 		if err != nil {
 			return errors.Wrap(err, "parse alert query url")
 		}
 
 		tsdbOpts := &tsdb.Options{
-			MinBlockDuration: *tsdbBlockDuration,
-			MaxBlockDuration: *tsdbBlockDuration,
-			Retention:        *tsdbRetention,
-			NoLockfile:       true,
+			MinBlockDuration:  *tsdbBlockDuration,
+			MaxBlockDuration:  *tsdbBlockDuration,
+			RetentionDuration: *tsdbRetention,
+			NoLockfile:        true,
 		}
 
 		lookupQueries := map[string]struct{}{}
@@ -146,8 +140,8 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 			fileSD = file.NewDiscovery(conf, logger)
 		}
 
-		if len(*queries) < 1 && peer.Name() == "no gossip" && fileSD == nil {
-			return errors.Errorf("Gossip is disabled and no --query parameter was given.")
+		if fileSD == nil && len(*queries) == 0 {
+			return errors.Errorf("No --query parameter was given.")
 		}
 
 		return runRule(g,
@@ -168,7 +162,6 @@ func registerRule(m map[string]setupFunc, app *kingpin.Application, name string)
 			time.Duration(*evalInterval),
 			*dataDir,
 			*ruleFiles,
-			peer,
 			objStoreConfig,
 			tsdbOpts,
 			alertQueryURL,
@@ -202,7 +195,6 @@ func runRule(
 	evalInterval time.Duration,
 	dataDir string,
 	ruleFiles []string,
-	peer cluster.Peer,
 	objStoreConfig *pathOrContent,
 	tsdbOpts *tsdb.Options,
 	alertQueryURL *url.URL,
@@ -233,7 +225,7 @@ func runRule(
 			Name: "thanos_rule_loaded_rules",
 			Help: "Loaded rules partitioned by file and group",
 		},
-		[]string{"part_resp_strategy", "file", "group"},
+		[]string{"strategy", "file", "group"},
 	)
 	ruleEvalWarnings := prometheus.NewCounterVec(
 		prometheus.CounterOpts{
@@ -326,7 +318,7 @@ func runRule(
 			opts := opts
 			opts.Registerer = extprom.WrapRegistererWith(prometheus.Labels{"strategy": strings.ToLower(s.String())}, reg)
 			opts.Context = ctx
-			opts.QueryFunc = queryFunc(logger, peer, dnsProvider, duplicatedQuery, ruleEvalWarnings, s)
+			opts.QueryFunc = queryFunc(logger, dnsProvider, duplicatedQuery, ruleEvalWarnings, s)
 
 			ruleMgrs[s] = rules.NewManager(&opts)
 			g.Add(func() error {
@@ -341,33 +333,7 @@ func runRule(
 		}
 	}
 	{
-		var storeLset []storepb.Label
-		for _, l := range lset {
-			storeLset = append(storeLset, storepb.Label{Name: l.Name, Value: l.Value})
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		g.Add(func() error {
-			// New gossip cluster.
-			if err = peer.Join(cluster.PeerTypeSource, cluster.PeerMetadata{
-				Labels: storeLset,
-				// Start out with the full time range. The shipper will constrain it later.
-				// TODO(fabxc): minimum timestamp is never adjusted if shipping is disabled.
-				MinTime: 0,
-				MaxTime: math.MaxInt64,
-			}); err != nil {
-				return errors.Wrap(err, "join cluster")
-			}
-
-			<-ctx.Done()
-			return nil
-		}, func(error) {
-			cancel()
-			peer.Close(5 * time.Second)
-		})
-	}
-	{
-		// TODO(bwplotka): https://github.com/improbable-eng/thanos/issues/660
+		// TODO(bwplotka): https://github.com/thanos-io/thanos/issues/660
 		sdr := alert.NewSender(logger, reg, alertmgrs.get, nil, alertmgrsTimeout)
 		ctx, cancel := context.WithCancel(context.Background())
 
@@ -538,7 +504,6 @@ func runRule(
 			return errors.Wrap(s.Serve(l), "serve gRPC")
 		}, func(error) {
 			s.Stop()
-			runutil.CloseWithLogOnErr(logger, l, "store gRPC listener")
 		})
 	}
 	// Start UI & metrics HTTP server.
@@ -562,10 +527,12 @@ func runRule(
 			"web.prefix-header":   webPrefixHeaderName,
 		}
 
-		ui.NewRuleUI(logger, ruleMgrs, alertQueryURL.String(), flagsMap).Register(router.WithPrefix(webRoutePrefix))
+		ins := extpromhttp.NewInstrumentationMiddleware(reg)
+
+		ui.NewRuleUI(logger, ruleMgrs, alertQueryURL.String(), flagsMap).Register(router.WithPrefix(webRoutePrefix), ins)
 
 		api := v1.NewAPI(logger, ruleMgrs)
-		api.Register(router.WithPrefix(path.Join(webRoutePrefix, "/api/v1")), tracer, logger)
+		api.Register(router.WithPrefix(path.Join(webRoutePrefix, "/api/v1")), tracer, logger, ins)
 
 		mux := http.NewServeMux()
 		registerMetrics(mux, reg)
@@ -590,7 +557,7 @@ func runRule(
 		return err
 	}
 
-	var uploads = true
+	uploads := true
 	if len(confContentYaml) == 0 {
 		level.Info(logger).Log("msg", "No supported bucket was configured, uploads will be disabled")
 		uploads = false
@@ -622,13 +589,6 @@ func runRule(
 				if _, err := s.Sync(ctx); err != nil {
 					level.Warn(logger).Log("err", err)
 				}
-
-				minTime, _, err := s.Timestamps()
-				if err != nil {
-					level.Warn(logger).Log("msg", "reading timestamps failed", "err", err)
-				} else {
-					peer.SetTimestamps(minTime, math.MaxInt64)
-				}
 				return nil
 			})
 		}, func(error) {
@@ -636,7 +596,7 @@ func runRule(
 		})
 	}
 
-	level.Info(logger).Log("msg", "starting rule node", "peer", peer.Name())
+	level.Info(logger).Log("msg", "starting rule node")
 	return nil
 }
 
@@ -765,7 +725,6 @@ func removeDuplicateQueryAddrs(logger log.Logger, duplicatedQueriers prometheus.
 // back or the context get canceled.
 func queryFunc(
 	logger log.Logger,
-	peer cluster.Peer,
 	dnsProvider *dns.Provider,
 	duplicatedQuery prometheus.Counter,
 	ruleEvalWarnings *prometheus.CounterVec,
@@ -784,24 +743,9 @@ func queryFunc(
 	}
 
 	return func(ctx context.Context, q string, t time.Time) (promql.Vector, error) {
-		var addrs []string
-
-		// Add addresses from gossip.
-		peers := peer.PeerStates(cluster.PeerTypeQuery)
-		var ids []string
-		for id := range peers {
-			ids = append(ids, id)
-		}
-		sort.Slice(ids, func(i int, j int) bool {
-			return strings.Compare(ids[i], ids[j]) < 0
-		})
-		for _, id := range ids {
-			addrs = append(addrs, peers[id].QueryAPIAddr)
-		}
-
 		// Add DNS resolved addresses from static flags and file SD.
 		// TODO(bwplotka): Consider generating addresses in *url.URL
-		addrs = append(addrs, dnsProvider.Addresses()...)
+		addrs := dnsProvider.Addresses()
 
 		removeDuplicateQueryAddrs(logger, duplicatedQuery, addrs)
 
@@ -820,14 +764,14 @@ func queryFunc(
 
 			if err != nil {
 				level.Error(logger).Log("err", err, "query", q)
+			} else {
+				if len(warns) > 0 {
+					ruleEvalWarnings.WithLabelValues(strings.ToLower(partialResponseStrategy.String())).Inc()
+					// TODO(bwplotka): Propagate those to UI, probably requires changing rule manager code ):
+					level.Warn(logger).Log("warnings", strings.Join(warns, ", "), "query", q)
+				}
+				return v, nil
 			}
-
-			if err == nil && len(warns) > 0 {
-				ruleEvalWarnings.WithLabelValues(strings.ToLower(partialResponseStrategy.String())).Inc()
-				// TODO(bwplotka): Propagate those to UI, probably requires changing rule manager code ):
-				level.Warn(logger).Log("warnings", strings.Join(warns, ", "), "query", q)
-			}
-			return v, err
 		}
 		return nil, errors.Errorf("no query peer reachable")
 	}

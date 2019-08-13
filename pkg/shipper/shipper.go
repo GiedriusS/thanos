@@ -7,27 +7,23 @@ import (
 	"encoding/json"
 	"io/ioutil"
 	"math"
-	"net/url"
 	"os"
 	"path"
 	"path/filepath"
 	"sort"
-	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
-	"github.com/improbable-eng/thanos/pkg/block"
-	"github.com/improbable-eng/thanos/pkg/block/metadata"
-	"github.com/improbable-eng/thanos/pkg/objstore"
-	"github.com/improbable-eng/thanos/pkg/promclient"
-	"github.com/improbable-eng/thanos/pkg/runutil"
 	"github.com/oklog/ulid"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/common/model"
 	"github.com/prometheus/tsdb"
 	"github.com/prometheus/tsdb/fileutil"
 	"github.com/prometheus/tsdb/labels"
+	"github.com/thanos-io/thanos/pkg/block"
+	"github.com/thanos-io/thanos/pkg/block/metadata"
+	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/thanos/pkg/runutil"
 )
 
 type metrics struct {
@@ -81,7 +77,6 @@ func newMetrics(r prometheus.Registerer, uploadCompacted bool) *metrics {
 type Shipper struct {
 	logger          log.Logger
 	dir             string
-	workDir         string
 	metrics         *metrics
 	bucket          objstore.Bucket
 	labels          func() labels.Labels
@@ -120,39 +115,18 @@ func New(
 // to remote if necessary, including compacted blocks which are already in filesystem.
 // It attaches the Thanos metadata section in each meta JSON file.
 func NewWithCompacted(
-	ctx context.Context,
 	logger log.Logger,
 	r prometheus.Registerer,
 	dir string,
 	bucket objstore.Bucket,
 	lbls func() labels.Labels,
 	source metadata.SourceType,
-	prometheusURL *url.URL,
-) (*Shipper, error) {
+) *Shipper {
 	if logger == nil {
 		logger = log.NewNopLogger()
 	}
 	if lbls == nil {
 		lbls = func() labels.Labels { return nil }
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-
-	var flags promclient.Flags
-	if err := runutil.Retry(1*time.Second, ctx.Done(), func() (err error) {
-		flags, err = promclient.ConfiguredFlags(ctx, logger, prometheusURL)
-		if err != nil {
-			return errors.Wrap(err, "configured flags; failed to check if compaction is disabled")
-		}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-
-	if flags.TSDBMinTime != model.Duration(2*time.Hour) || flags.TSDBMaxTime != model.Duration(2*time.Hour) {
-		return nil, errors.Errorf("Found that TSDB Max time is %s and Min time is %s. To use shipper with upload compacted option, "+
-			"compaction needs to be disabled (storage.tsdb.min-block-duration = storage.tsdb.max-block-duration = 2h", flags.TSDBMinTime, flags.TSDBMaxTime)
 	}
 
 	return &Shipper{
@@ -163,7 +137,7 @@ func NewWithCompacted(
 		metrics:         newMetrics(r, true),
 		source:          source,
 		uploadCompacted: true,
-	}, nil
+	}
 }
 
 // Timestamps returns the minimum timestamp for which data is available and the highest timestamp
@@ -285,7 +259,7 @@ func (s *Shipper) Sync(ctx context.Context) (uploaded int, err error) {
 		if !os.IsNotExist(err) {
 			level.Warn(s.logger).Log("msg", "reading meta file failed, will override it", "err", err)
 		}
-		meta = &Meta{Version: 1}
+		meta = &Meta{Version: MetaVersion1}
 	}
 
 	// Build a map of blocks we already uploaded.
@@ -470,8 +444,13 @@ type Meta struct {
 	Uploaded []ulid.ULID `json:"uploaded"`
 }
 
-// MetaFilename is the known JSON filename for meta information.
-const MetaFilename = "thanos.shipper.json"
+const (
+	// MetaFilename is the known JSON filename for meta information.
+	MetaFilename = "thanos.shipper.json"
+
+	// MetaVersion1 represents 1 version of meta.
+	MetaVersion1 = 1
+)
 
 // WriteMetaFile writes the given meta into <dir>/thanos.shipper.json.
 func WriteMetaFile(logger log.Logger, dir string, meta *Meta) error {
@@ -508,7 +487,7 @@ func ReadMetaFile(dir string) (*Meta, error) {
 	if err := json.Unmarshal(b, &m); err != nil {
 		return nil, err
 	}
-	if m.Version != 1 {
+	if m.Version != MetaVersion1 {
 		return nil, errors.Errorf("unexpected meta file version %d", m.Version)
 	}
 
@@ -529,7 +508,7 @@ func renameFile(logger log.Logger, from, to string) error {
 		return err
 	}
 
-	if err = fileutil.Fsync(pdir); err != nil {
+	if err = fileutil.Fdatasync(pdir); err != nil {
 		runutil.CloseWithLogOnErr(logger, pdir, "rename file dir close")
 		return err
 	}
