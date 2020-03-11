@@ -46,6 +46,10 @@ linters-settings:
     errcheck:
         exclude: ./.errcheck_excludes.txt
 
+    govet:
+        settings:
+            printf.funcs: "wrapf,wrap,github.com/pkg/errors.New"
+
 issues:
     exclude-rules:
         # These are not being checked since these methods exist
