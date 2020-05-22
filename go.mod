@@ -9,6 +9,7 @@ require (
 	github.com/aliyun/aliyun-oss-go-sdk v2.0.4+incompatible
 	github.com/armon/go-metrics v0.3.0
 	github.com/bradfitz/gomemcache v0.0.0-20190913173617-a41fca850d0b
+	github.com/cenkalti/backoff v2.2.1+incompatible
 	github.com/cespare/xxhash v1.1.0
 	github.com/cortexproject/cortex v0.6.1-0.20200228110116-92ab6cbe0995
 	github.com/davecgh/go-spew v1.1.1

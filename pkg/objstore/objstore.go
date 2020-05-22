@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cenkalti/backoff"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
@@ -154,7 +155,21 @@ const DirDelim = "/"
 // DownloadFile downloads the src file from the bucket to dst. If dst is an existing
 // directory, a file with the same name as the source is created in dst.
 // If destination file is already existing, download file will overwrite it.
+// Will try 10 times with exponential backoff.
 func DownloadFile(ctx context.Context, logger log.Logger, bkt BucketReader, src, dst string) (err error) {
+	eb := backoff.NewExponentialBackOff()
+	b := backoff.WithMaxRetries(eb, 10)
+	bCtx := backoff.WithContext(b, ctx)
+
+	return backoff.Retry(backoff.Operation(func() error {
+		return downloadFile(ctx, logger, bkt, src, dst)
+	}), bCtx)
+}
+
+// downloadFile downloads the src file from the bucket to dst. If dst is an existing
+// directory, a file with the same name as the source is created in dst.
+// If destination file is already existing, download file will overwrite it.
+func downloadFile(ctx context.Context, logger log.Logger, bkt BucketReader, src, dst string) (err error) {
 	if fi, err := os.Stat(dst); err == nil {
 		if fi.IsDir() {
 			dst = filepath.Join(dst, filepath.Base(src))
