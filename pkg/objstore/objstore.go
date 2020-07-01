@@ -83,12 +83,28 @@ type InstrumentedBucketReader interface {
 	ReaderWithExpectedErrs(IsOpFailureExpectedFunc) BucketReader
 }
 
+// HashKind stores what kind of algorithm has been used to calculate the integrity.
+type HashKind string
+
+var (
+	MD5Hash HashKind = "MD5"
+)
+
+// ObjectHash stores the kind of the object's hash and its value.
+type ObjectHash struct {
+	Kind  HashKind
+	Value string
+}
+
 type ObjectAttributes struct {
 	// Size is the object size in bytes.
 	Size int64 `json:"size"`
 
 	// LastModified is the timestamp the object was last modified.
 	LastModified time.Time `json:"last_modified"`
+
+	// Hash stores the object's hash and its value.
+	Hash ObjectHash `json:"-"`
 }
 
 // TryToGetSize tries to get upfront size from reader.

@@ -139,6 +139,7 @@ func (c *Container) Attributes(ctx context.Context, name string) (objstore.Objec
 	return objstore.ObjectAttributes{
 		Size:         headers.ContentLength,
 		LastModified: headers.LastModified,
+		Hash:         objstore.ObjectHash{Kind: objstore.MD5Hash, Value: headers.ETag},
 	}, nil
 }
 

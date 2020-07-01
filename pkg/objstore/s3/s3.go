@@ -342,6 +342,7 @@ func (b *Bucket) Attributes(_ context.Context, name string) (objstore.ObjectAttr
 	return objstore.ObjectAttributes{
 		Size:         objInfo.Size,
 		LastModified: objInfo.LastModified,
+		Hash:         objstore.ObjectHash{Kind: objstore.MD5Hash, Value: objInfo.ETag},
 	}, nil
 }
 

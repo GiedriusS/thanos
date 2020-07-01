@@ -247,6 +247,7 @@ func (b *Bucket) Attributes(ctx context.Context, name string) (objstore.ObjectAt
 	return objstore.ObjectAttributes{
 		Size:         props.ContentLength(),
 		LastModified: props.LastModified(),
+		Hash:         objstore.ObjectHash{Kind: objstore.MD5Hash, Value: string(props.ContentMD5())},
 	}, nil
 }
 
