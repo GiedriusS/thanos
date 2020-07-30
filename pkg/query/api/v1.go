@@ -26,6 +26,7 @@ import (
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/NYTimes/gziphandler"
@@ -40,9 +41,15 @@ import (
 	"github.com/prometheus/prometheus/promql"
 	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/storage"
+
+	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/query"
+	"github.com/thanos-io/thanos/pkg/rules"
+	"github.com/thanos-io/thanos/pkg/rules/rulespb"
 	"github.com/thanos-io/thanos/pkg/runutil"
+	"github.com/thanos-io/thanos/pkg/store/storepb"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
@@ -80,6 +87,29 @@ func (e *ApiError) Error() string {
 	return fmt.Sprintf("%s: %s", e.Typ, e.Err)
 }
 
+// ThanosVersion contains build information about Thanos.
+type ThanosVersion struct {
+	Version   string `json:"version"`
+	Revision  string `json:"revision"`
+	Branch    string `json:"branch"`
+	BuildUser string `json:"buildUser"`
+	BuildDate string `json:"buildDate"`
+	GoVersion string `json:"goVersion"`
+}
+
+// RuntimeInfo contains runtime information about Thanos.
+type RuntimeInfo struct {
+	StartTime      time.Time `json:"startTime"`
+	CWD            string    `json:"CWD"`
+	GoroutineCount int       `json:"goroutineCount"`
+	GOMAXPROCS     int       `json:"GOMAXPROCS"`
+	GOGC           string    `json:"GOGC"`
+	GODEBUG        string    `json:"GODEBUG"`
+}
+
+// RuntimeInfoFn returns updated runtime information about Thanos.
+type RuntimeInfoFn func() RuntimeInfo
+
 type response struct {
 	Status    status      `json:"status"`
 	Data      interface{} `json:"data,omitempty"`
@@ -101,13 +131,20 @@ type ApiFunc func(r *http.Request) (interface{}, []error, *ApiError)
 // them using the provided storage and query engine.
 type API struct {
 	logger          log.Logger
+	reg             prometheus.Registerer
+	gate            gate.Gate
 	queryableCreate query.QueryableCreator
 	queryEngine     *promql.Engine
+	ruleGroups      rules.UnaryClient
 
-	enableAutodownsampling                 bool
-	enablePartialResponse                  bool
-	replicaLabels                          []string
-	reg                                    prometheus.Registerer
+	enableAutodownsampling     bool
+	enableQueryPartialResponse bool
+	enableRulePartialResponse  bool
+	replicaLabels              []string
+	flagsMap                   map[string]string
+	runtimeInfo                RuntimeInfoFn
+	buildInfo                  *ThanosVersion
+
 	storeSet                               *query.StoreSet
 	defaultInstantQueryMaxSourceResolution time.Duration
 
@@ -121,21 +158,34 @@ func NewAPI(
 	storeSet *query.StoreSet,
 	qe *promql.Engine,
 	c query.QueryableCreator,
+	ruleGroups rules.UnaryClient,
 	enableAutodownsampling bool,
-	enablePartialResponse bool,
+	enableQueryPartialResponse bool,
+	enableRulePartialResponse bool,
 	replicaLabels []string,
+	flagsMap map[string]string,
 	defaultInstantQueryMaxSourceResolution time.Duration,
+	maxConcurrentQueries int,
+	runtimeInfo RuntimeInfoFn,
+	buildInfo *ThanosVersion,
 ) *API {
 	return &API{
-		logger:                                 logger,
-		queryEngine:                            qe,
-		queryableCreate:                        c,
+		logger:          logger,
+		reg:             reg,
+		queryEngine:     qe,
+		queryableCreate: c,
+		gate:            gate.NewKeeper(extprom.WrapRegistererWithPrefix("thanos_query_concurrent_", reg)).NewGate(maxConcurrentQueries),
+		ruleGroups:      ruleGroups,
+
 		enableAutodownsampling:                 enableAutodownsampling,
-		enablePartialResponse:                  enablePartialResponse,
+		enableQueryPartialResponse:             enableQueryPartialResponse,
+		enableRulePartialResponse:              enableRulePartialResponse,
 		replicaLabels:                          replicaLabels,
-		reg:                                    reg,
+		flagsMap:                               flagsMap,
 		storeSet:                               storeSet,
 		defaultInstantQueryMaxSourceResolution: defaultInstantQueryMaxSourceResolution,
+		runtimeInfo:                            runtimeInfo,
+		buildInfo:                              buildInfo,
 
 		now: time.Now,
 	}
@@ -173,7 +223,13 @@ func (api *API) Register(r *route.Router, tracer opentracing.Tracer, logger log.
 	r.Get("/labels", instr("label_names", api.labelNames))
 	r.Post("/labels", instr("label_names", api.labelNames))
 
+	r.Get("/status/flags", instr("status_flags", api.flags))
+	r.Get("/status/runtimeinfo", instr("status_runtime", api.serveRuntimeInfo))
+	r.Get("/status/buildinfo", instr("status_build", api.serveBuildInfo))
+
 	r.Get("/stores", instr("stores", api.stores))
+
+	r.Get("/rules", instr("rules", NewRulesHandler(api.ruleGroups, api.enableRulePartialResponse)))
 }
 
 type queryData struct {
@@ -235,19 +291,18 @@ func (api *API) parseDownsamplingParamMillis(r *http.Request, defaultVal time.Du
 	return int64(maxSourceResolution / time.Millisecond), nil
 }
 
-func (api *API) parsePartialResponseParam(r *http.Request) (enablePartialResponse bool, _ *ApiError) {
+func (api *API) parsePartialResponseParam(r *http.Request, defaultEnablePartialResponse bool) (enablePartialResponse bool, _ *ApiError) {
 	const partialResponseParam = "partial_response"
-	enablePartialResponse = api.enablePartialResponse
 
 	// Overwrite the cli flag when provided as a query parameter.
 	if val := r.FormValue(partialResponseParam); val != "" {
 		var err error
-		enablePartialResponse, err = strconv.ParseBool(val)
+		defaultEnablePartialResponse, err = strconv.ParseBool(val)
 		if err != nil {
 			return false, &ApiError{errorBadData, errors.Wrapf(err, "'%s' parameter", partialResponseParam)}
 		}
 	}
-	return enablePartialResponse, nil
+	return defaultEnablePartialResponse, nil
 }
 
 func (api *API) options(r *http.Request) (interface{}, []error, *ApiError) {
@@ -288,7 +343,7 @@ func (api *API) query(r *http.Request) (interface{}, []error, *ApiError) {
 		return nil, nil, apiErr
 	}
 
-	enablePartialResponse, apiErr := api.parsePartialResponseParam(r)
+	enablePartialResponse, apiErr := api.parsePartialResponseParam(r, api.enableQueryPartialResponse)
 	if apiErr != nil {
 		return nil, nil, apiErr
 	}
@@ -306,6 +361,14 @@ func (api *API) query(r *http.Request) (interface{}, []error, *ApiError) {
 	if err != nil {
 		return nil, nil, &ApiError{errorBadData, err}
 	}
+
+	tracing.DoInSpan(ctx, "query_gate_ismyturn", func(ctx context.Context) {
+		err = api.gate.Start(ctx)
+	})
+	if err != nil {
+		return nil, nil, &ApiError{errorExec, err}
+	}
+	defer api.gate.Done()
 
 	res := qry.Exec(ctx)
 	if res.Err != nil {
@@ -385,7 +448,7 @@ func (api *API) queryRange(r *http.Request) (interface{}, []error, *ApiError) {
 		return nil, nil, apiErr
 	}
 
-	enablePartialResponse, apiErr := api.parsePartialResponseParam(r)
+	enablePartialResponse, apiErr := api.parsePartialResponseParam(r, api.enableQueryPartialResponse)
 	if apiErr != nil {
 		return nil, nil, apiErr
 	}
@@ -404,6 +467,14 @@ func (api *API) queryRange(r *http.Request) (interface{}, []error, *ApiError) {
 	if err != nil {
 		return nil, nil, &ApiError{errorBadData, err}
 	}
+
+	tracing.DoInSpan(ctx, "query_gate_ismyturn", func(ctx context.Context) {
+		err = api.gate.Start(ctx)
+	})
+	if err != nil {
+		return nil, nil, &ApiError{errorExec, err}
+	}
+	defer api.gate.Done()
 
 	res := qry.Exec(ctx)
 	if res.Err != nil {
@@ -430,7 +501,7 @@ func (api *API) labelValues(r *http.Request) (interface{}, []error, *ApiError) {
 		return nil, nil, &ApiError{errorBadData, errors.Errorf("invalid label name: %q", name)}
 	}
 
-	enablePartialResponse, apiErr := api.parsePartialResponseParam(r)
+	enablePartialResponse, apiErr := api.parsePartialResponseParam(r, api.enableQueryPartialResponse)
 	if apiErr != nil {
 		return nil, nil, apiErr
 	}
@@ -446,6 +517,10 @@ func (api *API) labelValues(r *http.Request) (interface{}, []error, *ApiError) {
 	vals, warnings, err := q.LabelValues(name)
 	if err != nil {
 		return nil, nil, &ApiError{errorExec, err}
+	}
+
+	if vals == nil {
+		vals = make([]string, 0)
 	}
 
 	return vals, warnings, nil
@@ -506,7 +581,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 		return nil, nil, apiErr
 	}
 
-	enablePartialResponse, apiErr := api.parsePartialResponseParam(r)
+	enablePartialResponse, apiErr := api.parsePartialResponseParam(r, api.enableQueryPartialResponse)
 	if apiErr != nil {
 		return nil, nil, apiErr
 	}
@@ -519,17 +594,11 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 	defer runutil.CloseWithLogOnErr(api.logger, q, "queryable series")
 
 	var (
-		warnings []error
-		metrics  = []labels.Labels{}
-		sets     []storage.SeriesSet
+		metrics = []labels.Labels{}
+		sets    []storage.SeriesSet
 	)
 	for _, mset := range matcherSets {
-		s, warns, err := q.Select(false, nil, mset...)
-		if err != nil {
-			return nil, nil, &ApiError{errorExec, err}
-		}
-		warnings = append(warnings, warns...)
-		sets = append(sets, s)
+		sets = append(sets, q.Select(false, nil, mset...))
 	}
 
 	set := storage.NewMergeSeriesSet(sets, storage.ChainedSeriesMerge)
@@ -539,7 +608,7 @@ func (api *API) series(r *http.Request) (interface{}, []error, *ApiError) {
 	if set.Err() != nil {
 		return nil, nil, &ApiError{errorExec, set.Err()}
 	}
-	return metrics, warnings, nil
+	return metrics, set.Warnings(), nil
 }
 
 func Respond(w http.ResponseWriter, data interface{}, warnings []error) {
@@ -614,7 +683,7 @@ func parseDuration(s string) (time.Duration, error) {
 func (api *API) labelNames(r *http.Request) (interface{}, []error, *ApiError) {
 	ctx := r.Context()
 
-	enablePartialResponse, apiErr := api.parsePartialResponseParam(r)
+	enablePartialResponse, apiErr := api.parsePartialResponseParam(r, api.enableQueryPartialResponse)
 	if apiErr != nil {
 		return nil, nil, apiErr
 	}
@@ -639,4 +708,47 @@ func (api *API) stores(r *http.Request) (interface{}, []error, *ApiError) {
 		statuses[status.StoreType.String()] = append(statuses[status.StoreType.String()], status)
 	}
 	return statuses, nil, nil
+}
+
+func (api *API) flags(r *http.Request) (interface{}, []error, *ApiError) {
+	return api.flagsMap, nil, nil
+}
+
+func (api *API) serveRuntimeInfo(r *http.Request) (interface{}, []error, *ApiError) {
+	return api.runtimeInfo(), nil, nil
+}
+
+func (api *API) serveBuildInfo(r *http.Request) (interface{}, []error, *ApiError) {
+	return api.buildInfo, nil, nil
+}
+
+// NewRulesHandler created handler compatible with HTTP /api/v1/rules https://prometheus.io/docs/prometheus/latest/querying/api/#rules
+// which uses gRPC Unary Rules API.
+func NewRulesHandler(client rules.UnaryClient, enablePartialResponse bool) func(*http.Request) (interface{}, []error, *ApiError) {
+	ps := storepb.PartialResponseStrategy_ABORT
+	if enablePartialResponse {
+		ps = storepb.PartialResponseStrategy_WARN
+	}
+
+	return func(r *http.Request) (interface{}, []error, *ApiError) {
+		typeParam := r.URL.Query().Get("type")
+		typ, ok := rulespb.RulesRequest_Type_value[strings.ToUpper(typeParam)]
+		if !ok {
+			if typeParam != "" {
+				return nil, nil, &ApiError{errorBadData, errors.Errorf("invalid rules parameter type='%v'", typeParam)}
+			}
+			typ = int32(rulespb.RulesRequest_ALL)
+		}
+
+		// TODO(bwplotka): Allow exactly the same functionality as query API: passing replica, dedup and partial response as HTTP params as well.
+		req := &rulespb.RulesRequest{
+			Type:                    rulespb.RulesRequest_Type(typ),
+			PartialResponseStrategy: ps,
+		}
+		groups, warnings, err := client.Rules(r.Context(), req)
+		if err != nil {
+			return nil, nil, &ApiError{ErrorInternal, errors.Errorf("error retrieving rules: %v", err)}
+		}
+		return groups, warnings, nil
+	}
 }

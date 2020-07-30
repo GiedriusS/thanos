@@ -15,13 +15,14 @@ import (
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
-	"github.com/prometheus/prometheus/pkg/relabel"
 	"github.com/thanos-io/thanos/pkg/block"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
+	"github.com/thanos-io/thanos/pkg/gate"
 	"github.com/thanos-io/thanos/pkg/model"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
@@ -33,7 +34,6 @@ import (
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/ui"
 	"gopkg.in/alecthomas/kingpin.v2"
-	yaml "gopkg.in/yaml.v2"
 )
 
 const fetcherConcurrency = 32
@@ -63,7 +63,7 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 		Default("2GB").Bytes()
 
 	maxSampleCount := cmd.Flag("store.grpc.series-sample-limit",
-		"Maximum amount of samples returned via a single Series call. 0 means no limit. NOTE: For efficiency we take 120 as the number of samples in chunk (it cannot be bigger than that), so the actual number of samples might be lower, even though the maximum could be hit.").
+		"Maximum amount of samples returned via a single Series call. The Series call fails if this limit is exceeded. 0 means no limit. NOTE: For efficiency the limit is internally implemented as 'chunks limit' considering each chunk contains 120 samples (it's the max number of samples each chunk can contain), so the actual number of samples might be lower, even though the maximum could be hit.").
 		Default("0").Uint()
 
 	maxConcurrent := cmd.Flag("store.grpc.series-max-concurrency", "Maximum number of concurrent Series calls.").Default("20").Int()
@@ -87,13 +87,9 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 
 	selectorRelabelConf := regSelectorRelabelFlags(cmd)
 
-	// TODO(bwplotka): Remove in v0.13.0 if no issues.
-	disableIndexHeader := cmd.Flag("store.disable-index-header", "If specified, Store Gateway will use index-cache.json for each block instead of recreating binary index-header").
-		Hidden().Default("false").Bool()
-
 	postingOffsetsInMemSampling := cmd.Flag("store.index-header-posting-offsets-in-mem-sampling", "Controls what is the ratio of postings offsets store will hold in memory. "+
 		"Larger value will keep less offsets, which will increase CPU cycles needed for query touching those postings. It's meant for setups that want low baseline memory pressure and where less traffic is expected. "+
-		"On the contrary, smaller value will increase baseline memory usage, but improve latency slightly. 1 will keep all in memory. Default value is the same as in Prometheus which gives a good balance. This works only when --store.disable-index-header is NOT specified.").
+		"On the contrary, smaller value will increase baseline memory usage, but improve latency slightly. 1 will keep all in memory. Default value is the same as in Prometheus which gives a good balance.").
 		Hidden().Default(fmt.Sprintf("%v", store.DefaultPostingOffsetInMemorySampling)).Int()
 
 	enablePostingsCompression := cmd.Flag("experimental.enable-index-cache-postings-compression", "If true, Store Gateway will reencode and compress postings before storing them into cache. Compressed postings take about 10% of the original size.").
@@ -146,7 +142,6 @@ func registerStore(m map[string]setupFunc, app *kingpin.Application) {
 			},
 			selectorRelabelConf,
 			*advertiseCompatibilityLabel,
-			*disableIndexHeader,
 			*enablePostingsCompression,
 			time.Duration(*consistencyDelay),
 			time.Duration(*ignoreDeletionMarksDelay),
@@ -179,7 +174,7 @@ func runStore(
 	blockSyncConcurrency int,
 	filterConf *store.FilterConfig,
 	selectorRelabelConf *extflag.PathOrContent,
-	advertiseCompatibilityLabel, disableIndexHeader, enablePostingsCompression bool,
+	advertiseCompatibilityLabel, enablePostingsCompression bool,
 	consistencyDelay time.Duration,
 	ignoreDeletionMarksDelay time.Duration,
 	externalPrefix, prefixHeader string,
@@ -236,7 +231,7 @@ func runStore(
 		return errors.Wrap(err, "get content of relabel configuration")
 	}
 
-	relabelConfig, err := parseRelabelConfig(relabelContentYaml)
+	relabelConfig, err := block.ParseRelabelConfig(relabelContentYaml)
 	if err != nil {
 		return err
 	}
@@ -281,9 +276,17 @@ func runStore(
 		return errors.Wrap(err, "meta fetcher")
 	}
 
-	if !disableIndexHeader {
-		level.Info(logger).Log("msg", "index-header instead of index-cache.json enabled")
+	// Limit the concurrency on queries against the Thanos store.
+	if maxConcurrency < 0 {
+		return errors.Errorf("max concurrency value cannot be lower than 0 (got %v)", maxConcurrency)
 	}
+
+	queriesGate := gate.NewKeeper(extprom.WrapRegistererWithPrefix("thanos_bucket_store_series_", reg)).NewGate(maxConcurrency)
+	promauto.With(reg).NewGauge(prometheus.GaugeOpts{
+		Name: "thanos_bucket_store_queries_concurrent_max",
+		Help: "Number of maximum concurrent queries.",
+	}).Set(float64(maxConcurrency))
+
 	bs, err := store.NewBucketStore(
 		logger,
 		reg,
@@ -291,14 +294,13 @@ func runStore(
 		metaFetcher,
 		dataDir,
 		indexCache,
+		queriesGate,
 		chunkPoolSizeBytes,
-		maxSampleCount,
-		maxConcurrency,
+		store.NewChunksLimiterFactory(maxSampleCount/store.MaxSamplesPerChunk), // The samples limit is an approximation based on the max number of samples per chunk.
 		verbose,
 		blockSyncConcurrency,
 		filterConf,
 		advertiseCompatibilityLabel,
-		!disableIndexHeader,
 		enablePostingsCompression,
 		postingOffsetsInMemSampling,
 		false,
@@ -343,7 +345,7 @@ func runStore(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, component, grpcProbe, bs,
+		s := grpcserver.New(logger, reg, tracer, component, grpcProbe, bs, nil,
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),
@@ -369,13 +371,4 @@ func runStore(
 
 	level.Info(logger).Log("msg", "starting store node")
 	return nil
-}
-
-func parseRelabelConfig(contentYaml []byte) ([]*relabel.Config, error) {
-	var relabelConfig []*relabel.Config
-	if err := yaml.Unmarshal(contentYaml, &relabelConfig); err != nil {
-		return nil, errors.Wrap(err, "parsing relabel configuration")
-	}
-
-	return relabelConfig, nil
 }

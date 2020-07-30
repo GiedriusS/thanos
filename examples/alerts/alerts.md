@@ -54,7 +54,7 @@ rules:
 - alert: ThanosCompactHasNotRun
   annotations:
     message: Thanos Compact {{$labels.job}} has not uploaded anything for 24 hours.
-  expr: (time() - max(thanos_objstore_bucket_last_successful_upload_time{job=~"thanos-compact.*"}))
+  expr: (time() - max(max_over_time(thanos_objstore_bucket_last_successful_upload_time{job=~"thanos-compact.*"}[24h])))
     / 60 / 60 > 24
   labels:
     severity: warning
@@ -189,6 +189,7 @@ rules:
     sum(rate(prometheus_rule_evaluations_total{job=~"thanos-rule.*"}[2m])) <= 0
       and
     sum(thanos_rule_loaded_rules{job=~"thanos-rule.*"}) > 0
+  for: 3m
   labels:
     severity: critical
 ```
@@ -411,6 +412,29 @@ rules:
   for: 10m
   labels:
     severity: critical
+- alert: ThanosReceiveHighReplicationFailures
+  annotations:
+    message: Thanos Receive {{$labels.job}} is failing to replicate {{ $value | humanize
+      }}% of requests.
+  expr: |
+    thanos_receive_replication_factor > 1
+      and
+    (
+      (
+        sum by (job) (rate(thanos_receive_replications_total{result="error", job=~"thanos-receive.*"}[5m]))
+      /
+        sum by (job) (rate(thanos_receive_replications_total{job=~"thanos-receive.*"}[5m]))
+      )
+      >
+      (
+        max by (job) (floor((thanos_receive_replication_factor{job=~"thanos-receive.*"}+1) / 2))
+      /
+        max by (job) (thanos_receive_hashring_nodes{job=~"thanos-receive.*"})
+      )
+    ) * 100
+  for: 5m
+  labels:
+    severity: warning
 - alert: ThanosReceiveHighForwardRequestFailures
   annotations:
     message: Thanos Receive {{$labels.job}} is failing to forward {{ $value | humanize
@@ -420,13 +444,8 @@ rules:
       sum by (job) (rate(thanos_receive_forward_requests_total{result="error", job=~"thanos-receive.*"}[5m]))
     /
       sum by (job) (rate(thanos_receive_forward_requests_total{job=~"thanos-receive.*"}[5m]))
-    )
-    >
-    (
-      max by (job) (floor((thanos_receive_replication_factor{job=~"thanos-receive.*"}+1) / 2))
-    /
-      max by (job) (thanos_receive_hashring_nodes{job=~"thanos-receive.*"})
-    )
+    ) * 100 > 20
+  for: 5m
   labels:
     severity: warning
 - alert: ThanosReceiveHighHashringFileRefreshFailures
@@ -453,12 +472,15 @@ rules:
     severity: warning
 - alert: ThanosReceiveNoUpload
   annotations:
-    message: Thanos Receive {{$labels.job}} has not uploaded latest data to object
-      storage.
-  expr: increase(thanos_shipper_uploads_total{job=~"thanos-receive.*"}[2h]) == 0
-  for: 30m
+    message: Thanos Receive {{ $labels.instance }} of {{$labels.job}} has not uploaded
+      latest data to object storage.
+  expr: |
+    (up{job=~"thanos-receive.*"} - 1)
+    + on (instance) # filters to only alert on current instance last 3h
+    (sum by (instance) (increase(thanos_shipper_uploads_total{job=~"thanos-receive.*"}[3h])) == 0)
+  for: 3h
   labels:
-    severity: warning
+    severity: critical
 ```
 
 ## Replicate

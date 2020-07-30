@@ -219,6 +219,7 @@ func (r *Reloader) Watch(ctx context.Context) error {
 
 		if err := r.apply(ctx); err != nil {
 			// Critical error.
+			// TODO(bwplotka): There is no need to get process down in this case and decrease availability, handle the error in different way.
 			return err
 		}
 	}
@@ -287,7 +288,7 @@ func (r *Reloader) apply(ctx context.Context) error {
 				return err
 			}
 
-			// filepath.Walk uses Lstat to retriev os.FileInfo. Lstat does not
+			// filepath.Walk uses Lstat to retrieve os.FileInfo. Lstat does not
 			// follow symlinks. Make sure to follow a symlink before checking
 			// if it is a directory.
 			targetFile, err := os.Stat(path)

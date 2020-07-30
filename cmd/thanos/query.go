@@ -8,22 +8,25 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/run"
-	opentracing "github.com/opentracing/opentracing-go"
+	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/common/route"
+	"github.com/prometheus/common/version"
 	"github.com/prometheus/prometheus/discovery/file"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/promql"
-	kingpin "gopkg.in/alecthomas/kingpin.v2"
+	"gopkg.in/alecthomas/kingpin.v2"
 
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/discovery/cache"
@@ -34,6 +37,7 @@ import (
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/query"
 	v1 "github.com/thanos-io/thanos/pkg/query/api"
+	"github.com/thanos-io/thanos/pkg/rules"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	grpcserver "github.com/thanos-io/thanos/pkg/server/grpc"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
@@ -56,7 +60,7 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 	caCert := cmd.Flag("grpc-client-tls-ca", "TLS CA Certificates to use to verify gRPC servers").Default("").String()
 	serverName := cmd.Flag("grpc-client-server-name", "Server name to verify the hostname on the returned gRPC certificates. See https://tools.ietf.org/html/rfc4366#section-3.1").Default("").String()
 
-	webRoutePrefix := cmd.Flag("web.route-prefix", "Prefix for API and UI endpoints. This allows thanos UI to be served on a sub-path. This option is analogous to --web.route-prefix of Promethus.").Default("").String()
+	webRoutePrefix := cmd.Flag("web.route-prefix", "Prefix for API and UI endpoints. This allows thanos UI to be served on a sub-path. Defaults to the value of --web.external-prefix. This option is analogous to --web.route-prefix of Promethus.").Default("").String()
 	webExternalPrefix := cmd.Flag("web.external-prefix", "Static prefix for all HTML links and redirect URLs in the UI query web interface. Actual endpoints are still served on / or the web.route-prefix. This allows thanos UI to be served behind a reverse proxy that strips a URL sub-path.").Default("").String()
 	webPrefixHeaderName := cmd.Flag("web.prefix-header", "Name of HTTP request header used for dynamic prefixing of UI links and redirects. This option is ignored if web.external-prefix argument is set. Security risk: enable this option only if a reverse proxy in front of thanos is resetting the header. The --web.prefix-header=X-Forwarded-Prefix option can be useful, for example, if Thanos UI is served via Traefik reverse proxy with PathPrefixStrip option enabled, which sends the stripped prefix value in X-Forwarded-Prefix header. This allows thanos UI to be served on a sub-path.").Default("").String()
 
@@ -66,7 +70,10 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 	maxConcurrentQueries := cmd.Flag("query.max-concurrent", "Maximum number of queries processed concurrently by query node.").
 		Default("20").Int()
 
-	replicaLabels := cmd.Flag("query.replica-label", "Labels to treat as a replica indicator along which data is deduplicated. Still you will be able to query without deduplication using 'dedup=false' parameter.").
+	maxConcurrentSelects := cmd.Flag("query.max-concurrent-select", "Maximum number of select requests made concurrently per a query.").
+		Default("4").Int()
+
+	queryReplicaLabels := cmd.Flag("query.replica-label", "Labels to treat as a replica indicator along which data is deduplicated. Still you will be able to query without deduplication using 'dedup=false' parameter. Data includes time series, recording rules, and alerting rules.").
 		Strings()
 
 	instantDefaultMaxSourceResolution := modelDuration(cmd.Flag("query.instant.default.max_source_resolution", "default value for max_source_resolution for instant queries. If not set, defaults to 0s only taking raw resolution into account. 1h can be a good value if you use instant queries over time ranges that incorporate times outside of your raw-retention.").Default("0s").Hidden())
@@ -76,6 +83,10 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 
 	stores := cmd.Flag("store", "Addresses of statically configured store API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect store API servers through respective DNS lookups.").
 		PlaceHolder("<store>").Strings()
+
+	// TODO(bwplotka): Hidden because we plan to extract discovery to separate API: https://github.com/thanos-io/thanos/issues/2600.
+	ruleEndpoints := cmd.Flag("rule", "Experimental: Addresses of statically configured rules API servers (repeatable). The scheme may be prefixed with 'dns+' or 'dnssrv+' to detect rule API servers through respective DNS lookups.").
+		Hidden().PlaceHolder("<rule>").Strings()
 
 	strictStores := cmd.Flag("store-strict", "Addresses of only statically configured store API servers that are always used, even if the health check fails. Useful if you have a caching layer on top.").
 		PlaceHolder("<staticstore>").Strings()
@@ -98,8 +109,11 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 	enableAutodownsampling := cmd.Flag("query.auto-downsampling", "Enable automatic adjustment (step / 5) to what source of data should be used in store gateways if no max_source_resolution param is specified.").
 		Default("false").Bool()
 
-	enablePartialResponse := cmd.Flag("query.partial-response", "Enable partial response for queries if no partial_response param is specified. --no-query.partial-response for disabling.").
+	enableQueryPartialResponse := cmd.Flag("query.partial-response", "Enable partial response for queries if no partial_response param is specified. --no-query.partial-response for disabling.").
 		Default("true").Bool()
+
+	enableRulePartialResponse := cmd.Flag("rule.partial-response", "Enable partial response for rules endpoint. --no-rule.partial-response for disabling.").
+		Hidden().Default("true").Bool()
 
 	defaultEvaluationInterval := modelDuration(cmd.Flag("query.default-evaluation-interval", "Set default evaluation interval for sub queries.").Default("1m"))
 
@@ -111,13 +125,12 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			return errors.Wrap(err, "parse federation labels")
 		}
 
-		lookupStores := map[string]struct{}{}
-		for _, s := range *stores {
-			if _, ok := lookupStores[s]; ok {
-				return errors.Errorf("Address %s is duplicated for --store flag.", s)
-			}
+		if dup := firstDuplicate(*stores); dup != "" {
+			return errors.Errorf("Address %s is duplicated for --store flag.", dup)
+		}
 
-			lookupStores[s] = struct{}{}
+		if dup := firstDuplicate(*ruleEndpoints); dup != "" {
+			return errors.Errorf("Address %s is duplicated for --rule flag.", dup)
 		}
 
 		var fileSD *file.Discovery
@@ -129,7 +142,28 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			fileSD = file.NewDiscovery(conf, logger)
 		}
 
+		if *webRoutePrefix == "" {
+			*webRoutePrefix = *webExternalPrefix
+		}
+
+		if *webRoutePrefix != *webExternalPrefix {
+			level.Warn(logger).Log("msg", "different values for --web.route-prefix and --web.external-prefix detected, web UI may not work without a reverse-proxy.")
+		}
+
 		promql.SetDefaultEvaluationInterval(time.Duration(*defaultEvaluationInterval))
+
+		flagsMap := map[string]string{}
+
+		// Exclude kingpin default flags to expose only Thanos ones.
+		boilerplateFlags := kingpin.New("", "").Version("")
+
+		for _, f := range cmd.Model().Flags {
+			if boilerplateFlags.GetFlag(f.Name) != nil {
+				continue
+			}
+
+			flagsMap[f.Name] = f.Value.String()
+		}
 
 		return runQuery(
 			g,
@@ -152,13 +186,17 @@ func registerQuery(m map[string]setupFunc, app *kingpin.Application) {
 			*webExternalPrefix,
 			*webPrefixHeaderName,
 			*maxConcurrentQueries,
+			*maxConcurrentSelects,
 			time.Duration(*queryTimeout),
 			time.Duration(*storeResponseTimeout),
-			*replicaLabels,
+			*queryReplicaLabels,
 			selectorLset,
+			flagsMap,
 			*stores,
+			*ruleEndpoints,
 			*enableAutodownsampling,
-			*enablePartialResponse,
+			*enableQueryPartialResponse,
+			*enableRulePartialResponse,
 			fileSD,
 			time.Duration(*dnsSDInterval),
 			*dnsSDResolver,
@@ -193,13 +231,17 @@ func runQuery(
 	webExternalPrefix string,
 	webPrefixHeaderName string,
 	maxConcurrentQueries int,
+	maxConcurrentSelects int,
 	queryTimeout time.Duration,
 	storeResponseTimeout time.Duration,
-	replicaLabels []string,
+	queryReplicaLabels []string,
 	selectorLset labels.Labels,
+	flagsMap map[string]string,
 	storeAddrs []string,
+	ruleAddrs []string,
 	enableAutodownsampling bool,
-	enablePartialResponse bool,
+	enableQueryPartialResponse bool,
+	enableRulePartialResponse bool,
 	fileSD *file.Discovery,
 	dnsSDInterval time.Duration,
 	dnsSDResolver string,
@@ -220,7 +262,7 @@ func runQuery(
 	}
 
 	fileSDCache := cache.New()
-	dnsProvider := dns.NewProvider(
+	dnsStoreProvider := dns.NewProvider(
 		logger,
 		extprom.WrapRegistererWithPrefix("thanos_querier_store_apis_", reg),
 		dns.ResolverType(dnsSDResolver),
@@ -232,21 +274,35 @@ func runQuery(
 		}
 	}
 
+	dnsRuleProvider := dns.NewProvider(
+		logger,
+		extprom.WrapRegistererWithPrefix("thanos_querier_rule_apis_", reg),
+		dns.ResolverType(dnsSDResolver),
+	)
+
 	var (
 		stores = query.NewStoreSet(
 			logger,
 			reg,
 			func() (specs []query.StoreSpec) {
-				// Add DNS resolved addresses.
-				for _, addr := range dnsProvider.Addresses() {
-					specs = append(specs, query.NewGRPCStoreSpec(addr, false))
-				}
+
 				// Add strict & static nodes.
 				for _, addr := range strictStores {
 					specs = append(specs, query.NewGRPCStoreSpec(addr, true))
 				}
+				// Add DNS resolved addresses from static flags and file SD.
+				for _, addr := range dnsStoreProvider.Addresses() {
+					specs = append(specs, query.NewGRPCStoreSpec(addr, false))
+				}
+				return removeDuplicateStoreSpecs(logger, duplicatedStores, specs)
+			},
+			func() (specs []query.RuleSpec) {
+				for _, addr := range dnsRuleProvider.Addresses() {
+					specs = append(specs, query.NewGRPCStoreSpec(addr, false))
+				}
 
-				specs = removeDuplicateStoreSpecs(logger, duplicatedStores, specs)
+				// NOTE(s-urbaniak): No need to remove duplicates, as rule apis are a subset of store apis.
+				// hence, any duplicates will be tracked in the store api set.
 
 				return specs
 			},
@@ -254,7 +310,8 @@ func runQuery(
 			unhealthyStoreTimeout,
 		)
 		proxy            = store.NewProxyStore(logger, reg, stores.Get, component.Query, selectorLset, storeResponseTimeout)
-		queryableCreator = query.NewQueryableCreator(logger, proxy)
+		rulesProxy       = rules.NewProxy(logger, stores.GetRulesClients)
+		queryableCreator = query.NewQueryableCreator(logger, reg, proxy, maxConcurrentSelects, queryTimeout)
 		engine           = promql.NewEngine(
 			promql.EngineOpts{
 				Logger: logger,
@@ -303,9 +360,11 @@ func runQuery(
 					}
 					fileSDCache.Update(update)
 					stores.Update(ctxUpdate)
-					if err := dnsProvider.Resolve(ctxUpdate, append(fileSDCache.Addresses(), storeAddrs...)); err != nil {
+
+					if err := dnsStoreProvider.Resolve(ctxUpdate, append(fileSDCache.Addresses(), storeAddrs...)); err != nil {
 						level.Error(logger).Log("msg", "failed to resolve addresses for storeAPIs", "err", err)
 					}
+					// Rules apis do not support file service discovery as of now.
 				case <-ctxUpdate.Done():
 					return nil
 				}
@@ -320,8 +379,11 @@ func runQuery(
 		ctx, cancel := context.WithCancel(context.Background())
 		g.Add(func() error {
 			return runutil.Repeat(dnsSDInterval, ctx.Done(), func() error {
-				if err := dnsProvider.Resolve(ctx, append(fileSDCache.Addresses(), storeAddrs...)); err != nil {
+				if err := dnsStoreProvider.Resolve(ctx, append(fileSDCache.Addresses(), storeAddrs...)); err != nil {
 					level.Error(logger).Log("msg", "failed to resolve addresses for storeAPIs", "err", err)
+				}
+				if err := dnsRuleProvider.Resolve(ctx, ruleAddrs); err != nil {
+					level.Error(logger).Log("msg", "failed to resolve addresses for rulesAPIs", "err", err)
 				}
 				return nil
 			})
@@ -353,11 +415,56 @@ func runQuery(
 			router = router.WithPrefix(webRoutePrefix)
 		}
 
+		buildInfo := &v1.ThanosVersion{
+			Version:   version.Version,
+			Revision:  version.Revision,
+			Branch:    version.Branch,
+			BuildUser: version.BuildUser,
+			BuildDate: version.BuildDate,
+			GoVersion: version.GoVersion,
+		}
+
+		CWD, err := os.Getwd()
+		if err != nil {
+			CWD = "<error retrieving current working directory>"
+			level.Warn(logger).Log("msg", "failed to retrieve current working directory", "err", err)
+		}
+
+		birth := time.Now()
+
+		var runtimeInfo v1.RuntimeInfoFn = func() v1.RuntimeInfo {
+			return v1.RuntimeInfo{
+				StartTime:      birth,
+				CWD:            CWD,
+				GoroutineCount: runtime.NumGoroutine(),
+				GOMAXPROCS:     runtime.GOMAXPROCS(0),
+				GOGC:           os.Getenv("GOGC"),
+				GODEBUG:        os.Getenv("GODEBUG"),
+			}
+		}
+
 		ins := extpromhttp.NewInstrumentationMiddleware(reg)
 		// TODO(bplotka in PR #513 review): pass all flags, not only the flags needed by prefix rewriting.
-		ui.NewQueryUI(logger, reg, stores, webExternalPrefix, webPrefixHeaderName).Register(router, ins)
+		ui.NewQueryUI(logger, reg, stores, webExternalPrefix, webPrefixHeaderName, runtimeInfo, *buildInfo).Register(router, ins)
 
-		api := v1.NewAPI(logger, reg, stores, engine, queryableCreator, enableAutodownsampling, enablePartialResponse, replicaLabels, instantDefaultMaxSourceResolution)
+		api := v1.NewAPI(
+			logger,
+			reg,
+			stores,
+			engine,
+			queryableCreator,
+			// NOTE: Will share the same replica label as the query for now.
+			rules.NewGRPCClientWithDedup(rulesProxy, queryReplicaLabels),
+			enableAutodownsampling,
+			enableQueryPartialResponse,
+			enableRulePartialResponse,
+			queryReplicaLabels,
+			flagsMap,
+			instantDefaultMaxSourceResolution,
+			maxConcurrentQueries,
+			runtimeInfo,
+			buildInfo,
+		)
 
 		api.Register(router.WithPrefix("/api/v1"), tracer, logger, ins)
 
@@ -385,7 +492,7 @@ func runQuery(
 			return errors.Wrap(err, "setup gRPC server")
 		}
 
-		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, proxy,
+		s := grpcserver.New(logger, reg, tracer, comp, grpcProbe, proxy, rulesProxy,
 			grpcserver.WithListen(grpcBindAddr),
 			grpcserver.WithGracePeriod(grpcGracePeriod),
 			grpcserver.WithTLSConfig(tlsCfg),
@@ -419,4 +526,20 @@ func removeDuplicateStoreSpecs(logger log.Logger, duplicatedStores prometheus.Co
 		deduplicated = append(deduplicated, value)
 	}
 	return deduplicated
+}
+
+// firstDuplicate returns the first duplicate string in the given string slice
+// or empty string if none was found.
+func firstDuplicate(ss []string) string {
+	set := map[string]struct{}{}
+
+	for _, s := range ss {
+		if _, ok := set[s]; ok {
+			return s
+		}
+
+		set[s] = struct{}{}
+	}
+
+	return ""
 }

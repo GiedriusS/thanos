@@ -93,11 +93,14 @@ Flags:
                                  memory.
       --store.grpc.series-sample-limit=0
                                  Maximum amount of samples returned via a single
-                                 Series call. 0 means no limit. NOTE: For
-                                 efficiency we take 120 as the number of samples
-                                 in chunk (it cannot be bigger than that), so
-                                 the actual number of samples might be lower,
-                                 even though the maximum could be hit.
+                                 Series call. The Series call fails if this
+                                 limit is exceeded. 0 means no limit. NOTE: For
+                                 efficiency the limit is internally implemented
+                                 as 'chunks limit' considering each chunk
+                                 contains 120 samples (it's the max number of
+                                 samples each chunk can contain), so the actual
+                                 number of samples might be lower, even though
+                                 the maximum could be hit.
       --store.grpc.series-max-concurrency=20
                                  Maximum number of concurrent Series calls.
       --objstore.config-file=<file-path>
@@ -322,58 +325,6 @@ Note that chunks and metadata cache is an experimental feature, and these fields
 
 ## Index Header
 
-In order to query series inside blocks from object storage, Store Gateway has to know certain initial info about each block such as:
+In order to query series inside blocks from object storage, Store Gateway has to know certain initial info from each block index. In order to achieve so, on startup the Gateway builds an `index-header` for each block and stores it on local disk; such `index-header` is build downloading specific pieces of original block's index, stored on local disk and then mmaped and used by Store Gateway.
 
-- symbols table to unintern string values
-- postings offset for posting lookup
-
-In order to achieve so, on startup for each block `index-header` is built from pieces of original block's index and stored on disk.
-Such `index-header` file is then mmaped and used by Store Gateway.
-
-### Format (version 1)
-
-The following describes the format of the `index-header` file found in each block store gateway local directory.
-It is terminated by a table of contents which serves as an entry point into the index.
-
-```
-┌─────────────────────────────┬───────────────────────────────┐
-│    magic(0xBAAAD792) <4b>   │      version(1) <1 byte>      │
-├─────────────────────────────┬───────────────────────────────┤
-│  index version(2) <1 byte>  │ index PostingOffsetTable <8b> │
-├─────────────────────────────┴───────────────────────────────┤
-│ ┌─────────────────────────────────────────────────────────┐ │
-│ │      Symbol Table (exact copy from original index)      │ │
-│ ├─────────────────────────────────────────────────────────┤ │
-│ │      Posting Offset Table (exact copy from index)       │ │
-│ ├─────────────────────────────────────────────────────────┤ │
-│ │                          TOC                            │ │
-│ └─────────────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────────────┘
-```
-
-When the index is written, an arbitrary number of padding bytes may be added between the lined out main sections above. When sequentially scanning through the file, any zero bytes after a section's specified length must be skipped.
-
-Most of the sections described below start with a `len` field. It always specifies the number of bytes just before the trailing CRC32 checksum. The checksum is always calculated over those `len` bytes.
-
-### Symbol Table
-
-See [Symbols](https://github.com/prometheus/prometheus/blob/d782387f814753b0118d402ec8cdbdef01bf9079/tsdb/docs/format/index.md#symbol-table)
-
-### Postings Offset Table
-
-See [Posting Offset Table](https://github.com/prometheus/prometheus/blob/d782387f814753b0118d402ec8cdbdef01bf9079/tsdb/docs/format/index.md#postings-offset-table)
-
-### TOC
-
-The table of contents serves as an entry point to the entire index and points to various sections in the file.
-If a reference is zero, it indicates the respective section does not exist and empty results should be returned upon lookup.
-
-```
-┌─────────────────────────────────────────┐
-│ ref(symbols) <8b>                       │
-├─────────────────────────────────────────┤
-│ ref(postings offset table) <8b>         │
-├─────────────────────────────────────────┤
-│ CRC32 <4b>                              │
-└─────────────────────────────────────────┘
-```
+For more information, please refer to the [Binary index-header](../operating/binary-index-header.md) operational guide.

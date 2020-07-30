@@ -12,9 +12,9 @@ import (
 	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -23,6 +23,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/discovery/targetgroup"
+	"gopkg.in/yaml.v2"
+
 	"github.com/thanos-io/thanos/pkg/alert"
 	http_util "github.com/thanos-io/thanos/pkg/http"
 	"github.com/thanos-io/thanos/pkg/promclient"
@@ -30,13 +32,12 @@ import (
 	"github.com/thanos-io/thanos/pkg/runutil"
 	"github.com/thanos-io/thanos/pkg/testutil"
 	"github.com/thanos-io/thanos/test/e2e/e2ethanos"
-	yaml "gopkg.in/yaml.v2"
 )
 
 const (
 	testAlertRuleAbortOnPartialResponse = `
 groups:
-- name: example
+- name: example_abort
   # Abort should be a default: partial_response_strategy: "ABORT"
   rules:
   - alert: TestAlert_AbortOnPartialResponse
@@ -49,7 +50,7 @@ groups:
 `
 	testAlertRuleWarnOnPartialResponse = `
 groups:
-- name: example
+- name: example_warn
   partial_response_strategy: "WARN"
   rules:
   - alert: TestAlert_WarnOnPartialResponse
@@ -207,7 +208,7 @@ func TestRule_AlertmanagerHTTPClient(t *testing.T) {
 
 	s, err := e2e.NewScenario("e2e_test_rule_am_http_client")
 	testutil.Ok(t, err)
-	defer s.Close()
+	t.Cleanup(e2ethanos.CleanScenario(t, s))
 
 	tlsSubDir := filepath.Join("tls")
 	testutil.Ok(t, os.MkdirAll(filepath.Join(s.SharedDir(), tlsSubDir), os.ModePerm))
@@ -215,12 +216,12 @@ func TestRule_AlertmanagerHTTPClient(t *testing.T) {
 	// API v1 with plain HTTP and a prefix.
 	handler1 := newMockAlertmanager("/prefix/api/v1/alerts", "")
 	srv1 := httptest.NewServer(handler1)
-	defer srv1.Close()
+	t.Cleanup(srv1.Close)
 
 	// API v2 with HTTPS and authentication.
 	handler2 := newMockAlertmanager("/api/v2/alerts", "secret")
 	srv2 := httptest.NewTLSServer(handler2)
-	defer srv2.Close()
+	t.Cleanup(srv2.Close)
 
 	var out bytes.Buffer
 	testutil.Ok(t, pem.Encode(&out, &pem.Block{Type: "CERTIFICATE", Bytes: srv2.TLS.Certificates[0].Certificate[0]}))
@@ -259,7 +260,7 @@ func TestRule_AlertmanagerHTTPClient(t *testing.T) {
 		{
 			EndpointsConfig: http_util.EndpointsConfig{
 				StaticAddresses: func() []string {
-					q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", nil, nil)
+					q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", nil, nil, nil, "", "")
 					testutil.Ok(t, err)
 					return []string{q.NetworkHTTPEndpointFor(s.NetworkName())}
 				}(),
@@ -270,12 +271,12 @@ func TestRule_AlertmanagerHTTPClient(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(r))
 
-	q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{r.GRPCNetworkEndpoint()}, nil)
+	q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{r.GRPCNetworkEndpoint()}, nil, nil, "", "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(q))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	testutil.Ok(t, runutil.Retry(5*time.Second, ctx.Done(), func() (err error) {
 		for i, am := range []*mockAlertmanager{handler1, handler2} {
@@ -293,10 +294,10 @@ func TestRule(t *testing.T) {
 
 	s, err := e2e.NewScenario("e2e_test_rule")
 	testutil.Ok(t, err)
-	defer s.Close()
+	t.Cleanup(e2ethanos.CleanScenario(t, s))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
-	defer cancel()
+	t.Cleanup(cancel)
 
 	// Prepare work dirs.
 	rulesSubDir := filepath.Join("rules")
@@ -350,7 +351,7 @@ func TestRule(t *testing.T) {
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(r))
 
-	q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{r.GRPCNetworkEndpoint()}, nil)
+	q, err := e2ethanos.NewQuerier(s.SharedDir(), "1", []string{r.GRPCNetworkEndpoint()}, nil, nil, "", "")
 	testutil.Ok(t, err)
 	testutil.Ok(t, s.StartAndWaitReady(q))
 
@@ -515,7 +516,7 @@ func TestRule(t *testing.T) {
 		},
 	}
 
-	alrts, err := queryAlertmanagerAlerts(ctx, "http://"+am2.HTTPEndpoint())
+	alrts, err := promclient.NewDefaultClient().AlertmanagerAlerts(ctx, mustUrlParse(t, "http://"+am2.HTTPEndpoint()))
 	testutil.Ok(t, err)
 
 	testutil.Equals(t, len(expAlertLabels), len(alrts))
@@ -524,51 +525,15 @@ func TestRule(t *testing.T) {
 	}
 }
 
-// Test Ruler behaviour on different storepb.PartialResponseStrategy when having partial response from single `failingStoreAPI`.
+func mustUrlParse(t *testing.T, addr string) *url.URL {
+	u, err := url.Parse(addr)
+	testutil.Ok(t, err)
+	return u
+}
+
+// Test Ruler behavior on different storepb.PartialResponseStrategy when having partial response from single `failingStoreAPI`.
 func TestRulePartialResponse(t *testing.T) {
 	t.Skip("TODO: Allow HTTP ports from binaries running on host to be accessible.")
 
 	// TODO: Implement with failing store.
-}
-
-// TODO(bwplotka): Move to promclient.
-func queryAlertmanagerAlerts(ctx context.Context, url string) ([]*model.Alert, error) {
-	code, body, err := getAPIEndpoint(ctx, url+"/api/v1/alerts")
-	if err != nil {
-		return nil, err
-	}
-	if code != 200 {
-		return nil, errors.Errorf("expected 200 response, got %d", code)
-	}
-
-	var v struct {
-		Data []*model.Alert `json:"data"`
-	}
-	if err = json.Unmarshal(body, &v); err != nil {
-		return nil, err
-	}
-
-	sort.Slice(v.Data, func(i, j int) bool {
-		return v.Data[i].Labels.Before(v.Data[j].Labels)
-	})
-	return v.Data, nil
-}
-
-func getAPIEndpoint(ctx context.Context, url string) (int, []byte, error) {
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	req = req.WithContext(ctx)
-
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer runutil.CloseWithLogOnErr(nil, resp.Body, "%s: close body", req.URL.String())
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return 0, nil, err
-	}
-	return resp.StatusCode, body, nil
 }

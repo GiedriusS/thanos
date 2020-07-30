@@ -9,6 +9,7 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -123,7 +124,7 @@ func prepareTestBlocks(t testing.TB, now time.Time, count int, dir string, bkt o
 	return
 }
 
-func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, manyParts bool, maxSampleCount uint64, relabelConfig []*relabel.Config, filterConf *FilterConfig) *storeSuite {
+func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, manyParts bool, maxChunksLimit uint64, relabelConfig []*relabel.Config, filterConf *FilterConfig) *storeSuite {
 	series := []labels.Labels{
 		labels.FromStrings("a", "1", "b", "1"),
 		labels.FromStrings("a", "1", "b", "2"),
@@ -159,13 +160,12 @@ func prepareStoreWithTestBlocks(t testing.TB, dir string, bkt objstore.Bucket, m
 		metaFetcher,
 		dir,
 		s.cache,
+		nil,
 		0,
-		maxSampleCount,
-		20,
+		NewChunksLimiterFactory(maxChunksLimit),
 		false,
 		20,
 		filterConf,
-		true,
 		true,
 		true,
 		DefaultPostingOffsetInMemorySampling,
@@ -446,7 +446,7 @@ func TestBucketStore_e2e(t *testing.T) {
 			return
 		}
 
-		if ok := t.Run("with small index cache", func(t *testing.T) {
+		t.Run("with small index cache", func(t *testing.T) {
 			indexCache2, err := storecache.NewInMemoryIndexCacheWithConfig(s.logger, nil, storecache.InMemoryIndexCacheConfig{
 				MaxItemSize: 50,
 				MaxSize:     100,
@@ -454,9 +454,7 @@ func TestBucketStore_e2e(t *testing.T) {
 			testutil.Ok(t, err)
 			s.cache.SwapWith(indexCache2)
 			testBucketStore_e2e(t, ctx, s)
-		}); !ok {
-			return
-		}
+		})
 	})
 }
 
@@ -507,7 +505,10 @@ func TestBucketStore_TimePartitioning_e2e(t *testing.T) {
 	hourAfter := time.Now().Add(1 * time.Hour)
 	filterMaxTime := model.TimeOrDurationValue{Time: &hourAfter}
 
-	s := prepareStoreWithTestBlocks(t, dir, bkt, false, 241, emptyRelabelConfig, &FilterConfig{
+	// The query will fetch 2 series from 2 blocks, so we do expect to hit a total of 4 chunks.
+	expectedChunks := uint64(2 * 2)
+
+	s := prepareStoreWithTestBlocks(t, dir, bkt, false, expectedChunks, emptyRelabelConfig, &FilterConfig{
 		MinTime: minTimeDuration,
 		MaxTime: filterMaxTime,
 	})
@@ -544,5 +545,57 @@ func TestBucketStore_TimePartitioning_e2e(t *testing.T) {
 		// prepareTestBlocks makes 3 chunks containing 2 hour data,
 		// we should only get 1, as we are filtering by time.
 		testutil.Equals(t, 1, len(s.Chunks))
+	}
+}
+
+func TestBucketStore_Series_ChunksLimiter_e2e(t *testing.T) {
+	// The query will fetch 2 series from 6 blocks, so we do expect to hit a total of 12 chunks.
+	expectedChunks := uint64(2 * 6)
+
+	cases := map[string]struct {
+		maxChunksLimit uint64
+		expectedErr    string
+	}{
+		"should succeed if the max chunks limit is not exceeded": {
+			maxChunksLimit: expectedChunks,
+		},
+		"should fail if the max chunks limit is exceeded": {
+			maxChunksLimit: expectedChunks - 1,
+			expectedErr:    "exceeded chunks limit",
+		},
+	}
+
+	for testName, testData := range cases {
+		t.Run(testName, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			bkt := objstore.NewInMemBucket()
+
+			dir, err := ioutil.TempDir("", "test_bucket_chunks_limiter_e2e")
+			testutil.Ok(t, err)
+			defer func() { testutil.Ok(t, os.RemoveAll(dir)) }()
+
+			s := prepareStoreWithTestBlocks(t, dir, bkt, false, testData.maxChunksLimit, emptyRelabelConfig, allowAllFilterConf)
+			testutil.Ok(t, s.store.SyncBlocks(ctx))
+
+			req := &storepb.SeriesRequest{
+				Matchers: []storepb.LabelMatcher{
+					{Type: storepb.LabelMatcher_EQ, Name: "a", Value: "1"},
+				},
+				MinTime: minTimeDuration.PrometheusTimestamp(),
+				MaxTime: maxTimeDuration.PrometheusTimestamp(),
+			}
+
+			s.cache.SwapWith(noopCache{})
+			srv := newStoreSeriesServer(ctx)
+			err = s.store.Series(req, srv)
+
+			if testData.expectedErr == "" {
+				testutil.Ok(t, err)
+			} else {
+				testutil.NotOk(t, err)
+				testutil.Assert(t, strings.Contains(err.Error(), testData.expectedErr))
+			}
+		})
 	}
 }

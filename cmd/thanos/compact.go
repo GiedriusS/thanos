@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,7 +15,6 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/oklog/run"
-	"github.com/oklog/ulid"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,26 +23,18 @@ import (
 	"github.com/prometheus/common/route"
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/thanos-io/thanos/pkg/block"
-	"github.com/thanos-io/thanos/pkg/block/indexheader"
-	"github.com/thanos-io/thanos/pkg/block/metadata"
 	"github.com/thanos-io/thanos/pkg/compact"
 	"github.com/thanos-io/thanos/pkg/compact/downsample"
 	"github.com/thanos-io/thanos/pkg/component"
 	"github.com/thanos-io/thanos/pkg/extflag"
 	"github.com/thanos-io/thanos/pkg/extprom"
 	extpromhttp "github.com/thanos-io/thanos/pkg/extprom/http"
-	"github.com/thanos-io/thanos/pkg/objstore"
 	"github.com/thanos-io/thanos/pkg/objstore/client"
 	"github.com/thanos-io/thanos/pkg/prober"
 	"github.com/thanos-io/thanos/pkg/runutil"
 	httpserver "github.com/thanos-io/thanos/pkg/server/http"
 	"github.com/thanos-io/thanos/pkg/ui"
 	"gopkg.in/alecthomas/kingpin.v2"
-)
-
-const (
-	metricIndexGenerateName = "thanos_compact_generated_index_total"
-	metricIndexGenerateHelp = "Total number of generated indexes."
 )
 
 var (
@@ -132,6 +122,10 @@ func runCompact(
 		Name: "thanos_compactor_blocks_marked_for_deletion_total",
 		Help: "Total number of blocks marked for deletion in compactor.",
 	})
+	garbageCollectedBlocks := promauto.With(reg).NewCounter(prometheus.CounterOpts{
+		Name: "thanos_compact_garbage_collected_blocks_total",
+		Help: "Total number of blocks marked for deletion by compactor.",
+	})
 	_ = promauto.With(reg).NewGaugeFunc(prometheus.GaugeOpts{
 		Name: "thanos_delete_delay_seconds",
 		Help: "Configured delete delay in seconds.",
@@ -178,7 +172,7 @@ func runCompact(
 		return errors.Wrap(err, "get content of relabel configuration")
 	}
 
-	relabelConfig, err := parseRelabelConfig(relabelContentYaml)
+	relabelConfig, err := block.ParseRelabelConfig(relabelContentYaml)
 	if err != nil {
 		return err
 	}
@@ -237,8 +231,8 @@ func runCompact(
 			duplicateBlocksFilter,
 			ignoreDeletionMarkFilter,
 			blocksMarkedForDeletion,
-			conf.blockSyncConcurrency,
-			conf.acceptMalformedIndex, enableVerticalCompaction)
+			garbageCollectedBlocks,
+			conf.blockSyncConcurrency)
 		if err != nil {
 			return errors.Wrap(err, "create syncer")
 		}
@@ -265,7 +259,6 @@ func runCompact(
 	var (
 		compactDir      = path.Join(conf.dataDir, "compact")
 		downsamplingDir = path.Join(conf.dataDir, "downsample")
-		indexCacheDir   = path.Join(conf.dataDir, "index_cache")
 	)
 
 	if err := os.RemoveAll(downsamplingDir); err != nil {
@@ -273,8 +266,9 @@ func runCompact(
 		return errors.Wrap(err, "clean working downsample directory")
 	}
 
+	grouper := compact.NewDefaultGrouper(logger, bkt, conf.acceptMalformedIndex, enableVerticalCompaction, reg, blocksMarkedForDeletion, garbageCollectedBlocks)
 	blocksCleaner := compact.NewBlocksCleaner(logger, bkt, ignoreDeletionMarkFilter, deleteDelay, blocksCleaned, blockCleanupFailures)
-	compactor, err := compact.NewBucketCompactor(logger, sy, comp, compactDir, bkt, conf.compactionConcurrency)
+	compactor, err := compact.NewBucketCompactor(logger, sy, grouper, comp, compactDir, bkt, conf.compactionConcurrency)
 	if err != nil {
 		cancel()
 		return errors.Wrap(err, "create bucket compactor")
@@ -308,6 +302,12 @@ func runCompact(
 			level.Info(logger).Log("msg", "start first pass of downsampling")
 			if err := sy.SyncMetas(ctx); err != nil {
 				return errors.Wrap(err, "sync before first pass of downsampling")
+			}
+
+			for _, meta := range sy.Metas() {
+				groupKey := compact.DefaultGroupKey(meta.Thanos)
+				downsampleMetrics.downsamples.WithLabelValues(groupKey)
+				downsampleMetrics.downsampleFailures.WithLabelValues(groupKey)
 			}
 			if err := downsampleBucket(ctx, logger, downsampleMetrics, bkt, sy.Metas(), downsamplingDir); err != nil {
 				return errors.Wrap(err, "first pass of downsampling failed")
@@ -344,17 +344,6 @@ func runCompact(
 
 	g.Add(func() error {
 		defer runutil.CloseWithLogOnErr(logger, bkt, "bucket client")
-
-		// Generate index files.
-		// TODO(bwplotka): Remove this in next release.
-		if conf.generateMissingIndexCacheFiles {
-			if err := sy.SyncMetas(ctx); err != nil {
-				return err
-			}
-			if err := genMissingIndexCacheFiles(ctx, logger, reg, bkt, sy.Metas(), indexCacheDir); err != nil {
-				return err
-			}
-		}
 
 		if !conf.wait {
 			return compactMainFn()
@@ -417,7 +406,7 @@ func runCompact(
 			iterCancel()
 
 			// For /global state make sure to fetch periodically.
-			return runutil.Repeat(time.Minute, ctx.Done(), func() error {
+			return runutil.Repeat(conf.blockViewerSyncBlockInterval, ctx.Done(), func() error {
 				return runutil.RetryWithLog(logger, time.Minute, ctx.Done(), func() error {
 					iterCtx, iterCancel := context.WithTimeout(ctx, conf.waitInterval)
 					defer iterCancel()
@@ -439,96 +428,6 @@ func runCompact(
 	return nil
 }
 
-// genMissingIndexCacheFiles scans over all blocks, generates missing index cache files and uploads them to object storage.
-func genMissingIndexCacheFiles(ctx context.Context, logger log.Logger, reg *prometheus.Registry, bkt objstore.Bucket, metas map[ulid.ULID]*metadata.Meta, dir string) error {
-	genIndex := promauto.With(reg).NewCounter(prometheus.CounterOpts{
-		Name: metricIndexGenerateName,
-		Help: metricIndexGenerateHelp,
-	})
-
-	if err := os.RemoveAll(dir); err != nil {
-		return errors.Wrap(err, "clean index cache directory")
-	}
-	if err := os.MkdirAll(dir, 0777); err != nil {
-		return errors.Wrap(err, "create dir")
-	}
-
-	defer func() {
-		if err := os.RemoveAll(dir); err != nil {
-			level.Error(logger).Log("msg", "failed to remove index cache directory", "path", dir, "err", err)
-		}
-	}()
-
-	level.Info(logger).Log("msg", "start index cache processing")
-
-	for _, meta := range metas {
-		// New version of compactor pushes index cache along with data block.
-		// Skip uncompacted blocks.
-		if meta.Compaction.Level == 1 {
-			continue
-		}
-
-		if err := generateIndexCacheFile(ctx, bkt, logger, dir, meta); err != nil {
-			return err
-		}
-		genIndex.Inc()
-	}
-
-	level.Info(logger).Log("msg", "generating index cache files is done, you can remove startup argument `index.generate-missing-cache-file`")
-	return nil
-}
-
-func generateIndexCacheFile(
-	ctx context.Context,
-	bkt objstore.Bucket,
-	logger log.Logger,
-	indexCacheDir string,
-	meta *metadata.Meta,
-) error {
-	id := meta.ULID
-
-	bdir := filepath.Join(indexCacheDir, id.String())
-	if err := os.MkdirAll(bdir, 0777); err != nil {
-		return errors.Wrap(err, "create block dir")
-	}
-
-	defer func() {
-		if err := os.RemoveAll(bdir); err != nil {
-			level.Error(logger).Log("msg", "failed to remove index cache directory", "path", bdir, "err", err)
-		}
-	}()
-
-	cachePath := filepath.Join(bdir, block.IndexCacheFilename)
-	cache := path.Join(meta.ULID.String(), block.IndexCacheFilename)
-
-	ok, err := bkt.Exists(ctx, cache)
-	if ok {
-		return nil
-	}
-	if err != nil {
-		return errors.Wrapf(err, "attempt to check if a cached index file exists")
-	}
-
-	level.Debug(logger).Log("msg", "make index cache", "block", id)
-
-	// Try to download index file from obj store.
-	indexPath := filepath.Join(bdir, block.IndexFilename)
-	index := path.Join(id.String(), block.IndexFilename)
-
-	if err := objstore.DownloadFile(ctx, logger, bkt, index, indexPath); err != nil {
-		return errors.Wrap(err, "download index file")
-	}
-
-	if err := indexheader.WriteJSON(logger, indexPath, cachePath); err != nil {
-		return errors.Wrap(err, "write index cache")
-	}
-
-	if err := objstore.UploadFile(ctx, logger, bkt, cachePath, cache); err != nil {
-		return errors.Wrap(err, "upload index cache")
-	}
-	return nil
-}
-
 type compactConfig struct {
 	haltOnError                                    bool
 	acceptMalformedIndex                           bool
@@ -540,9 +439,9 @@ type compactConfig struct {
 	retentionRaw, retentionFiveMin, retentionOneHr model.Duration
 	wait                                           bool
 	waitInterval                                   time.Duration
-	generateMissingIndexCacheFiles                 bool
 	disableDownsampling                            bool
 	blockSyncConcurrency                           int
+	blockViewerSyncBlockInterval                   time.Duration
 	compactionConcurrency                          int
 	deleteDelay                                    model.Duration
 	dedupReplicaLabels                             []string
@@ -584,15 +483,14 @@ func (cc *compactConfig) registerFlag(cmd *kingpin.CmdClause) *compactConfig {
 	cmd.Flag("wait-interval", "Wait interval between consecutive compaction runs and bucket refreshes. Only works when --wait flag specified.").
 		Default("5m").DurationVar(&cc.waitInterval)
 
-	cmd.Flag("index.generate-missing-cache-file", "DEPRECATED flag. Will be removed in next release. If enabled, on startup compactor runs an on-off job that scans all the blocks to find all blocks with missing index cache file. It generates those if needed and upload.").
-		Hidden().Default("false").BoolVar(&cc.generateMissingIndexCacheFiles)
-
 	cmd.Flag("downsampling.disable", "Disables downsampling. This is not recommended "+
 		"as querying long time ranges without non-downsampled data is not efficient and useful e.g it is not possible to render all samples for a human eye anyway").
 		Default("false").BoolVar(&cc.disableDownsampling)
 
 	cmd.Flag("block-sync-concurrency", "Number of goroutines to use when syncing block metadata from object storage.").
 		Default("20").IntVar(&cc.blockSyncConcurrency)
+	cmd.Flag("block-viewer.global.sync-block-interval", "Repeat interval for syncing the blocks between local and remote view for /global Block Viewer UI.").
+		Default("1m").DurationVar(&cc.blockViewerSyncBlockInterval)
 
 	cmd.Flag("compact.concurrency", "Number of goroutines to use when compacting groups.").
 		Default("1").IntVar(&cc.compactionConcurrency)

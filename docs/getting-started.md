@@ -46,7 +46,7 @@ See [release process docs](release-process.md) for details.
 
 Thanos is built purely in [Golang](https://golang.org/), thus allowing to run Thanos on various x64 operating systems.
 
-If you want to build Thanos from source you would need a working installation of the Go 1.12+ [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`).
+If you want to build Thanos from source you would need a working installation of the Go 1.14+ [toolchain](https://github.com/golang/tools) (`GOPATH`, `PATH=${GOPATH}/bin:${PATH}`).
 
 Thanos can be downloaded and built by running:
 
@@ -91,7 +91,7 @@ If you want to add yourself to this list, let us know!
 
 ## Operating
 
-See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/master/mixin/thanos/README.md)
+See up to date [jsonnet mixins](https://github.com/thanos-io/thanos/tree/master/mixin/README.md)
 We also have example Grafana dashboards [here](/examples/dashboards/dashboards.md) and some [alerts](/examples/alerts/alerts.md) to get you started.
 
 ## Talks
@@ -110,6 +110,7 @@ We also have example Grafana dashboards [here](/examples/dashboards/dashboards.m
 
   * [Banzai Cloud user story](https://banzaicloud.com/blog/multi-cluster-monitoring/)
   * [A Production Thanos Deployment](https://www.omerlh.info/2020/02/08/a-production-thanos-deployment/)
+  * [Monitoring the Beat microservices: A tale of evolution](https://build.thebeat.co/monitoring-the-beat-microservices-a-tale-of-evolution-4e246882606e)
 
 * 2019:
 
