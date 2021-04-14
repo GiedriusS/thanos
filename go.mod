@@ -50,9 +50,11 @@ require (
 	github.com/prometheus/client_model v0.2.0
 	github.com/prometheus/common v0.18.0
 	github.com/prometheus/prometheus v1.8.2-0.20210315220929-1cba1741828b
+	github.com/segmentio/bloom v2.0.3+incompatible
 	github.com/uber/jaeger-client-go v2.25.0+incompatible
 	github.com/uber/jaeger-lib v2.4.0+incompatible
 	github.com/weaveworks/common v0.0.0-20210112142934-23c8d7fa6120
+	github.com/willf/bitset v1.1.11 // indirect
 	go.elastic.co/apm v1.11.0
 	go.elastic.co/apm/module/apmot v1.11.0
 	go.uber.org/atomic v1.7.0

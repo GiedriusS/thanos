@@ -32,6 +32,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	"github.com/prometheus/prometheus/tsdb/encoding"
 	"github.com/prometheus/prometheus/tsdb/index"
+	"github.com/segmentio/bloom"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -295,6 +296,8 @@ type BucketStore struct {
 
 	// Enables hints in the Series() response.
 	enableSeriesResponseHints bool
+
+	bloomFilterSize uint
 }
 
 type noopCache struct{}
@@ -349,6 +352,16 @@ func WithQueryGate(queryGate gate.Gate) BucketStoreOption {
 func WithChunkPool(chunkPool pool.Bytes) BucketStoreOption {
 	return func(s *BucketStore) {
 		s.chunkPool = chunkPool
+	}
+}
+
+// WithBloomFilterSize sets the size of the bloom filter over metric names
+// that is later exposed via Info().
+func WithBloomFilter(bloomFilterSize uint) BucketStoreOption {
+	return func(s *BucketStore) {
+		if bloomFilterSize != 0 {
+			s.bloomFilterSize = bloomFilterSize
+		}
 	}
 }
 
@@ -587,6 +600,7 @@ func (s *BucketStore) addBlock(ctx context.Context, meta *metadata.Meta) (err er
 		s.chunkPool,
 		indexHeaderReader,
 		s.partitioner,
+		s.bloomFilterSize,
 	)
 	if err != nil {
 		return errors.Wrap(err, "new bucket block")
@@ -680,6 +694,23 @@ func (s *BucketStore) Info(context.Context, *storepb.InfoRequest) (*storepb.Info
 		// See query.StoreCompatibilityTypeLabelName comment for details.
 		res.LabelSets = append(res.LabelSets, labelpb.ZLabelSet{Labels: []labelpb.ZLabel{{Name: CompatibilityTypeLabelName, Value: "store"}}})
 	}
+
+	res.BloomFilterVersion = 1
+	bf := bloom.New(s.bloomFilterSize, 4)
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	for _, b := range s.blocks {
+		bf.Merge(b.bf)
+	}
+
+	encodedBF, err := bf.GobEncode()
+	if err != nil {
+		return nil, errors.Wrap(err, "encoding bloom filter")
+	}
+	res.BloomFilter = encodedBF
+	res.BloomFilterSize = int64(s.bloomFilterSize)
 	return res, nil
 }
 
@@ -1471,6 +1502,8 @@ type bucketBlock struct {
 	// Block's labels used by block-level matchers to filter blocks to query. These are used to select blocks using
 	// request hints' BlockMatchers.
 	relabelLabels labels.Labels
+
+	bf *bloom.BloomFilter
 }
 
 func newBucketBlock(
@@ -1484,7 +1517,15 @@ func newBucketBlock(
 	chunkPool pool.Bytes,
 	indexHeadReader indexheader.Reader,
 	p Partitioner,
+	bloomFilterSize uint,
 ) (b *bucketBlock, err error) {
+	var bf *bloom.BloomFilter
+	if bloomFilterSize > 0 {
+		bf, err = CalculateBloom(indexHeadReader, bloomFilterSize, 4)
+		if err != nil {
+			return nil, errors.Wrap(err, "calculating bloom filter")
+		}
+	}
 	b = &bucketBlock{
 		logger:            logger,
 		metrics:           metrics,
@@ -1502,6 +1543,7 @@ func newBucketBlock(
 			Name:  block.BlockIDLabel,
 			Value: meta.ULID.String(),
 		}),
+		bf: bf,
 	}
 	sort.Sort(b.extLset)
 	sort.Sort(b.relabelLabels)

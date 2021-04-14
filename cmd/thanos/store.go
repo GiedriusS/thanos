@@ -78,6 +78,9 @@ func registerStore(app *extkingpin.App) {
 	syncInterval := cmd.Flag("sync-block-duration", "Repeat interval for syncing the blocks between local and remote view.").
 		Default("3m").Duration()
 
+	bloomFilterSize := cmd.Flag("bloom-filter-size", "Bloom filter over the metric names size. Gets sent over the Info() gRPC call. Can reduce the number of Series() calls in the case of horizontal sharding for some amount of memory").
+		Default("0").Hidden().Bytes()
+
 	blockSyncConcurrency := cmd.Flag("block-sync-concurrency", "Number of goroutines to use when constructing index-cache.json blocks from object storage.").
 		Default("20").Int()
 
@@ -180,6 +183,7 @@ func registerStore(app *extkingpin.App) {
 			getFlagsMap(cmd.Flags()),
 			*lazyIndexReaderEnabled,
 			*lazyIndexReaderIdleTimeout,
+			uint(*bloomFilterSize),
 		)
 	})
 }
@@ -219,6 +223,7 @@ func runStore(
 	flagsMap map[string]string,
 	lazyIndexReaderEnabled bool,
 	lazyIndexReaderIdleTimeout time.Duration,
+	bloomFilterSize uint,
 ) error {
 	grpcProbe := prober.NewGRPC()
 	httpProbe := prober.NewHTTP()
@@ -334,6 +339,7 @@ func runStore(
 		store.WithQueryGate(queriesGate),
 		store.WithChunkPool(chunkPool),
 		store.WithFilterConfig(filterConf),
+		store.WithBloomFilter(bloomFilterSize),
 	}
 
 	if verbose {

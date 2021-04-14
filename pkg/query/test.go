@@ -653,3 +653,5 @@ func (i inProcessClient) TimeRange() (mint int64, maxt int64) {
 
 func (i inProcessClient) String() string { return i.name }
 func (i inProcessClient) Addr() string   { return i.name }
+
+func (i inProcessClient) HasMetricName(metricName string) bool { return true }

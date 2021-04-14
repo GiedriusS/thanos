@@ -50,6 +50,8 @@ type Client interface {
 	String() string
 	// Addr returns address of a Client.
 	Addr() string
+
+	HasMetricName(metricName string) bool
 }
 
 // ProxyStore implements the store API that proxies request to all given underlying stores.
@@ -500,6 +502,17 @@ func storeMatches(ctx context.Context, s Client, mint, maxt int64, matchers ...*
 	extLset := s.LabelSets()
 	if !labelSetsMatch(matchers, extLset...) {
 		return false, fmt.Sprintf("external labels %v does not match request label matchers: %v", extLset, matchers)
+	}
+
+	metricName := ""
+	for _, matcher := range matchers {
+		if matcher.Name == "__name__" && matcher.Type == labels.MatchEqual {
+			metricName = matcher.Value
+		}
+	}
+
+	if metricName != "" && !s.HasMetricName(metricName) {
+		return false, fmt.Sprintf("bloom filter indicates that this store does not have the metric %s", metricName)
 	}
 	return true, ""
 }

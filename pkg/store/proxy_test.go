@@ -42,6 +42,8 @@ type testClient struct {
 	maxTime   int64
 }
 
+func (c testClient) HasMetricName(metricName string) bool { return true }
+
 func (c testClient) LabelSets() []labels.Labels {
 	return c.labelSets
 }

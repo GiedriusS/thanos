@@ -84,6 +84,15 @@ message InfoResponse {
   StoreType storeType  = 4;
   // label_sets is an unsorted list of `ZLabelSet`s.
   repeated ZLabelSet label_sets = 5 [(gogoproto.nullable) = false];
+
+  // To avoid sending requests to this node in some cases.
+  bytes bloomFilter = 6;
+
+  // To be able to differentiate between different bloom filter versions/content's structure.
+  int64 bloomFilterVersion = 7;
+
+  // The size of the bloom filter in bits.
+  int64 bloomFilterSize = 8;
 }
 
 message SeriesRequest {

@@ -17,6 +17,7 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/segmentio/bloom"
 	"github.com/thanos-io/thanos/pkg/exemplars/exemplarspb"
 	"google.golang.org/grpc"
 
@@ -42,7 +43,7 @@ type StoreSpec interface {
 	// If metadata call fails we assume that store is no longer accessible and we should not use it.
 	// NOTE: It is implementation responsibility to retry until context timeout, but a caller responsibility to manage
 	// given store connection.
-	Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []labels.Labels, mint int64, maxt int64, storeType component.StoreAPI, err error)
+	Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []labels.Labels, mint int64, maxt int64, storeType component.StoreAPI, bloomFilter []byte, bloomFilterVersion int64, bloomFilterSize int64, err error)
 
 	// StrictStatic returns true if the StoreAPI has been statically defined and it is under a strict mode.
 	StrictStatic() bool
@@ -117,11 +118,12 @@ func (s *grpcStoreSpec) Addr() string {
 
 // Metadata method for gRPC store API tries to reach host Info method until context timeout. If we are unable to get metadata after
 // that time, we assume that the host is unhealthy and return error.
-func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []labels.Labels, mint int64, maxt int64, Type component.StoreAPI, err error) {
+func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient) (labelSets []labels.Labels, mint int64, maxt int64, Type component.StoreAPI, bf []byte, bfVersion int64, bfSize int64, err error) {
 	resp, err := client.Info(ctx, &storepb.InfoRequest{}, grpc.WaitForReady(true))
 	if err != nil {
-		return nil, 0, 0, nil, errors.Wrapf(err, "fetching store info from %s", s.addr)
+		return nil, 0, 0, nil, nil, 0, 0, errors.Wrapf(err, "fetching store info from %s", s.addr)
 	}
+
 	if len(resp.LabelSets) == 0 && len(resp.Labels) > 0 {
 		resp.LabelSets = []labelpb.ZLabelSet{{Labels: resp.Labels}}
 	}
@@ -130,7 +132,7 @@ func (s *grpcStoreSpec) Metadata(ctx context.Context, client storepb.StoreClient
 	for _, ls := range resp.LabelSets {
 		labelSets = append(labelSets, ls.PromLabels())
 	}
-	return labelSets, resp.MinTime, resp.MaxTime, component.FromProto(resp.StoreType), nil
+	return labelSets, resp.MinTime, resp.MaxTime, component.FromProto(resp.StoreType), resp.BloomFilter, resp.BloomFilterVersion, resp.BloomFilterSize, nil
 }
 
 // storeSetNodeCollector is a metric collector reporting the number of available storeAPIs for Querier.
@@ -295,10 +297,13 @@ type storeRef struct {
 	minTime   int64
 	maxTime   int64
 
+	bloomFilter        *bloom.BloomFilter
+	bloomFilterVersion int64
+
 	logger log.Logger
 }
 
-func (s *storeRef) Update(labelSets []labels.Labels, minTime int64, maxTime int64, storeType component.StoreAPI, rule rulespb.RulesClient, target targetspb.TargetsClient, metadata metadatapb.MetadataClient, exemplar exemplarspb.ExemplarsClient) {
+func (s *storeRef) Update(labelSets []labels.Labels, minTime int64, maxTime int64, storeType component.StoreAPI, rule rulespb.RulesClient, target targetspb.TargetsClient, metadata metadatapb.MetadataClient, exemplar exemplarspb.ExemplarsClient, bf []byte, bfVersion, bfSize int64) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -310,6 +315,25 @@ func (s *storeRef) Update(labelSets []labels.Labels, minTime int64, maxTime int6
 	s.target = target
 	s.metadata = metadata
 	s.exemplar = exemplar
+
+	if bfVersion == 1 {
+		decodedBF := bloom.New(uint(bfSize), 4)
+		decodedBF.GobDecode(bf)
+		s.bloomFilter = decodedBF
+	}
+	s.bloomFilterVersion = bfVersion
+}
+
+func (s *storeRef) HasMetricName(metricName string) bool {
+	if s.bloomFilter == nil {
+		return true
+	}
+
+	if s.bloomFilterVersion != 1 {
+		return true
+	}
+
+	return s.bloomFilter.Test([]byte(metricName))
 }
 
 func (s *storeRef) StoreType() component.StoreAPI {
@@ -559,7 +583,7 @@ func (s *StoreSet) getActiveStores(ctx context.Context, stores map[string]*store
 			}
 
 			// Check existing or new store. Is it healthy? What are current metadata?
-			labelSets, minTime, maxTime, storeType, err := spec.Metadata(ctx, st.StoreClient)
+			labelSets, minTime, maxTime, storeType, bf, bfVersion, bfSize, err := spec.Metadata(ctx, st.StoreClient)
 			if err != nil {
 				if !seenAlready && !spec.StrictStatic() {
 					// Close only if new and not a strict static node.
@@ -582,7 +606,7 @@ func (s *StoreSet) getActiveStores(ctx context.Context, stores map[string]*store
 			}
 
 			s.updateStoreStatus(st, nil)
-			st.Update(labelSets, minTime, maxTime, storeType, rule, target, metadata, exemplar)
+			st.Update(labelSets, minTime, maxTime, storeType, rule, target, metadata, exemplar, bf, bfVersion, bfSize)
 
 			mtx.Lock()
 			defer mtx.Unlock()

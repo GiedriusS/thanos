@@ -216,6 +216,10 @@ func (s *storeRef) close() {
 	runutil.CloseWithLogOnErr(s.logger, s.cc, fmt.Sprintf("store %v connection close", s.addr))
 }
 
+func (s *storeRef) HasMetricName(metricName string) bool {
+	return true
+}
+
 // Update updates the store set. It fetches current list of store specs from function and updates the fresh metadata
 // from all stores.
 func (s *StoreSet) Update(ctx context.Context) {

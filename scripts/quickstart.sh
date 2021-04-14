@@ -174,6 +174,7 @@ if [ -n "${GCS_BUCKET}" -o -n "${S3_ENDPOINT}" ]; then
     --grpc-grace-period 1s \
     --http-address 0.0.0.0:10906 \
     --http-grace-period 1s \
+    --bloom-filter-size 50KiB \
     --data-dir data/store \
     ${OBJSTORECFG} &
 
