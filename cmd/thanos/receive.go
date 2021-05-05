@@ -235,6 +235,7 @@ func runReceive(
 	}
 	dialOpts, err := extgrpc.StoreClientGRPCOpts(
 		logger,
+		"",
 		reg,
 		tracer,
 		rwServerCert != "",

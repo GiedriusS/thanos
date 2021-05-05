@@ -222,6 +222,7 @@ type StoreSet struct {
 // NewStoreSet returns a new set of store APIs and potentially Rules APIs from given specs.
 func NewStoreSet(
 	logger log.Logger,
+	configInstance string,
 	reg *prometheus.Registry,
 	storeSpecs func() []StoreSpec,
 	ruleSpecs func() []RuleSpec,

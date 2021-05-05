@@ -15,16 +15,37 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
 
+	"github.com/thanos-io/thanos/pkg/store"
 	"github.com/thanos-io/thanos/pkg/tls"
 	"github.com/thanos-io/thanos/pkg/tracing"
 )
 
+// TODO(GiedriusS): pass skip verify.
+func StoreClientGRPCOptsFromTlsConfig(logger log.Logger, clientInstance string, reg *prometheus.Registry, tracer opentracing.Tracer, tlsConfig *store.TlsConfig) ([]grpc.DialOption, error) {
+	if tlsConfig != nil {
+		return StoreClientGRPCOpts(logger, clientInstance, reg, tracer, true, false, tlsConfig.Cert, tlsConfig.Key, tlsConfig.CaCert, tlsConfig.ServerName)
+	}
+	return StoreClientGRPCOpts(logger, clientInstance, reg, tracer, false, true, "", "", "", "")
+}
+
 // StoreClientGRPCOpts creates gRPC dial options for connecting to a store client.
-func StoreClientGRPCOpts(logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, secure, skipVerify bool, cert, key, caCert, serverName string) ([]grpc.DialOption, error) {
-	grpcMets := grpc_prometheus.NewClientMetrics()
-	grpcMets.EnableClientHandlingTimeHistogram(
-		grpc_prometheus.WithHistogramBuckets([]float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120, 240, 360, 720}),
-	)
+func StoreClientGRPCOpts(logger log.Logger, clientInstance string, reg *prometheus.Registry, tracer opentracing.Tracer, secure, skipVerify bool, cert, key, caCert, serverName string) ([]grpc.DialOption, error) {
+	var grpcMets *grpc_prometheus.ClientMetrics
+	histogramBuckets := grpc_prometheus.WithHistogramBuckets([]float64{0.001, 0.01, 0.1, 0.3, 0.6, 1, 3, 6, 9, 20, 30, 60, 90, 120, 240, 360, 720})
+	grpcMets.EnableClientHandlingTimeHistogram(histogramBuckets)
+
+	if clientInstance != "" {
+		constLabels := map[string]string{"config_name": clientInstance}
+		grpcMets = grpc_prometheus.NewClientMetrics(grpc_prometheus.WithConstLabels(constLabels))
+		grpcMets.EnableClientHandlingTimeHistogram(
+			grpc_prometheus.WithHistogramConstLabels(constLabels),
+			histogramBuckets,
+		)
+	} else {
+		grpcMets = grpc_prometheus.NewClientMetrics()
+		grpcMets.EnableClientHandlingTimeHistogram(histogramBuckets)
+	}
+
 	dialOpts := []grpc.DialOption{
 		// We want to make sure that we can receive huge gRPC messages from storeAPI.
 		// On TCP level we can be fine, but the gRPC overhead for huge messages could be significant.
