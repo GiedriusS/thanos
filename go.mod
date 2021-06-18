@@ -36,6 +36,7 @@ require (
 	github.com/leanovate/gopter v0.2.4
 	github.com/lightstep/lightstep-tracer-go v0.18.1
 	github.com/lovoo/gcloud-opentracing v0.3.0
+	github.com/mailgun/groupcache/v2 v2.2.1
 	github.com/miekg/dns v1.1.41
 	github.com/minio/minio-go/v7 v7.0.10
 	github.com/mozillazg/go-cos v0.13.0
@@ -54,6 +55,7 @@ require (
 	github.com/prometheus/common v0.23.0
 	github.com/prometheus/exporter-toolkit v0.5.1
 	github.com/prometheus/prometheus v1.8.2-0.20210519120135-d95b0972505f
+	github.com/sirupsen/logrus v1.8.1 // indirect
 	github.com/uber/jaeger-client-go v2.28.0+incompatible
 	github.com/uber/jaeger-lib v2.4.1+incompatible
 	github.com/weaveworks/common v0.0.0-20210419092856-009d1eebd624
@@ -65,6 +67,7 @@ require (
 	golang.org/x/crypto v0.0.0-20210220033148-5ea612d1eb83
 	golang.org/x/oauth2 v0.0.0-20210427180440-81ed05c6b58c
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
+	golang.org/x/sys v0.0.0-20210616094352-59db8d763f22 // indirect
 	golang.org/x/text v0.3.6
 	google.golang.org/api v0.46.0
 	google.golang.org/genproto v0.0.0-20210429181445-86c259c2b4ab

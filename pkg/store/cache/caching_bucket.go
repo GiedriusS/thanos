@@ -482,6 +482,7 @@ func mergeRanges(input []rng, limit int64) []rng {
 	return input[:last+1]
 }
 
+// TODO(GiedriusS): convert these to verb types.
 func cachingKeyAttributes(name string) string {
 	return fmt.Sprintf("attrs:%s", name)
 }
