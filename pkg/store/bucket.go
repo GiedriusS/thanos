@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/ioutil"
 	"math"
+	"math/bits"
 	"os"
 	"path"
 	"path/filepath"
@@ -758,14 +759,14 @@ func blockSeries(
 	skipChunks bool, // If true, chunks are not loaded.
 	minTime, maxTime int64, // Series must have data in this time range to be returned.
 	loadAggregates []storepb.Aggr, // List of aggregates to load when loading chunks.
-) (storepb.SeriesSet, *queryStats, error) {
+) ([]seriesEntry, *queryStats, error) {
 	ps, err := indexr.ExpandedPostings(matchers)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "expanded matching posting")
 	}
 
 	if len(ps) == 0 {
-		return storepb.EmptySeriesSet(), indexr.stats, nil
+		return []seriesEntry{}, indexr.stats, nil
 	}
 
 	// Reserve series seriesLimiter
@@ -830,14 +831,14 @@ func blockSeries(
 	}
 
 	if skipChunks {
-		return newBucketSeriesSet(res), indexr.stats, nil
+		return res, indexr.stats, nil
 	}
 
 	if err := chunkr.load(res, loadAggregates); err != nil {
 		return nil, nil, errors.Wrap(err, "load chunks")
 	}
 
-	return newBucketSeriesSet(res), indexr.stats.merge(chunkr.stats), nil
+	return res, indexr.stats.merge(chunkr.stats), nil
 }
 
 func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Aggr, save func([]byte) ([]byte, error)) error {
@@ -912,6 +913,12 @@ func populateChunk(out *storepb.AggrChunk, in chunkenc.Chunk, aggrs []storepb.Ag
 	return nil
 }
 
+// RespSender is something that can send a message over a transport.
+// Used for zero-alloc series responses.
+type RespSender interface {
+	SendMsg(interface{}) error
+}
+
 // debugFoundBlockSetOverview logs on debug level what exactly blocks we used for query in terms of
 // labels and resolution. This is important because we allow mixed resolution results, so it is quite crucial
 // to be aware what exactly resolution we see on query.
@@ -947,6 +954,33 @@ func debugFoundBlockSetOverview(logger log.Logger, mint, maxt, maxResolutionMill
 	level.Debug(logger).Log("msg", "Blocks source resolutions", "blocks", len(bs), "Maximum Resolution", maxResolutionMillis, "mint", mint, "maxt", maxt, "lset", lset.String(), "spans", strings.Join(parts, "\n"))
 }
 
+// estimateMaxSeriesEntrySize estimates the maximum amount of memory
+// a seriesEntry can take when encoded in protobufs.
+func estimateMaxSeriesEntrySize(sEs *[]seriesEntry) int {
+	// These were calculated from reading the protobuf encoding code
+	// and some trial & error.
+	sz := (1 + bits.UintSize/8)
+	for _, se := range *sEs {
+		for _, label := range se.lset {
+			sz += (1+bits.UintSize/8)*len(label.Name) + (1+bits.UintSize/8)*len(label.Value)
+		}
+		sz += (1 + bits.UintSize/8) * len(se.lset)
+	}
+
+	for _, se := range *sEs {
+		for _, chk := range se.chks {
+			// TODO(GiedriusS): we can reduce CPU usage
+			// even further by memoizing this but that's not possible
+			// until GetSeries() and others become an interface.
+			sz += chk.Size()
+		}
+		sz += (1 + bits.UintSize/8) * len(se.chks)
+
+	}
+
+	return sz
+}
+
 // Series implements the storepb.StoreServer interface.
 func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_SeriesServer) (err error) {
 	if s.queryGate != nil {
@@ -972,12 +1006,16 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 		stats            = &queryStats{}
 		res              []storepb.SeriesSet
 		mtx              sync.Mutex
+		seriesRespBuf    []byte
 		g, gctx          = errgroup.WithContext(ctx)
 		resHints         = &hintspb.SeriesResponseHints{}
 		reqBlockMatchers []*labels.Matcher
 		chunksLimiter    = s.chunksLimiterFactory(s.metrics.queriesDropped.WithLabelValues("chunks"))
 		seriesLimiter    = s.seriesLimiterFactory(s.metrics.queriesDropped.WithLabelValues("series"))
+		maxSize          int
 	)
+
+	srvRespSender, isRespSender := srv.(RespSender)
 
 	if req.Hints != nil {
 		reqHints := &hintspb.SeriesRequestHints{}
@@ -1040,8 +1078,23 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 					return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
 				}
 
+				localMax := 0
+				if isRespSender {
+					sz := estimateMaxSeriesEntrySize(&part)
+					if sz > localMax {
+						localMax = sz
+					}
+				}
+
 				mtx.Lock()
-				res = append(res, part)
+				if localMax > maxSize {
+					maxSize = localMax
+				}
+				if len(part) == 0 {
+					res = append(res, storepb.EmptySeriesSet())
+				} else {
+					res = append(res, newBucketSeriesSet(part))
+				}
 				stats = stats.merge(pstats)
 				mtx.Unlock()
 
@@ -1096,6 +1149,10 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 		stats.getAllDuration = time.Since(begin)
 		s.metrics.seriesGetAllDuration.Observe(stats.getAllDuration.Seconds())
 		s.metrics.seriesBlocksQueried.Observe(float64(stats.blocksQueried))
+
+		if isRespSender {
+			seriesRespBuf = make([]byte, maxSize)
+		}
 	}
 	// Merge the sub-results from each selected block.
 	tracing.DoInSpan(ctx, "bucket_store_merge_all", func(ctx context.Context) {
@@ -1119,6 +1176,16 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 				s.metrics.chunkSizeBytes.Observe(float64(chunksSize(series.Chunks)))
 			}
 			series.Labels = labelpb.ZLabelsFromPromLabels(lset)
+
+			if isRespSender {
+				seriesResp := storepb.NewSeriesResponse(&series)
+				if err = srvRespSender.SendMsg(storepb.NewSeriesResponseZeroMarshal(seriesResp, seriesRespBuf)); err != nil {
+					err = status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
+					return
+				}
+				continue
+			}
+
 			if err = srv.Send(storepb.NewSeriesResponse(&series)); err != nil {
 				err = status.Error(codes.Unknown, errors.Wrap(err, "send series response").Error())
 				return
@@ -1224,9 +1291,16 @@ func (s *BucketStore) LabelNames(ctx context.Context, req *storepb.LabelNamesReq
 
 				result = strutil.MergeSlices(res, extRes)
 			} else {
-				seriesSet, _, err := blockSeries(b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil)
+				seriesEntries, _, err := blockSeries(b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil)
 				if err != nil {
 					return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
+				}
+
+				var seriesSet storepb.SeriesSet
+				if len(seriesEntries) == 0 {
+					seriesSet = storepb.EmptySeriesSet()
+				} else {
+					seriesSet = newBucketSeriesSet(seriesEntries)
 				}
 
 				// Extract label names from all series. Many label names will be the same, so we need to deduplicate them.
@@ -1349,11 +1423,17 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 				}
 				result = res
 			} else {
-				seriesSet, _, err := blockSeries(b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil)
+				seriesEntries, _, err := blockSeries(b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil)
 				if err != nil {
 					return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
 				}
 
+				var seriesSet storepb.SeriesSet
+				if len(seriesEntries) == 0 {
+					seriesSet = storepb.EmptySeriesSet()
+				} else {
+					seriesSet = newBucketSeriesSet(seriesEntries)
+				}
 				// Extract given label's value from all series and deduplicate them.
 				// We don't need to deal with external labels, since they are already added by blockSeries.
 				values := map[string]struct{}{}
