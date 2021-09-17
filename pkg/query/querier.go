@@ -7,6 +7,7 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-kit/kit/log"
@@ -147,11 +148,15 @@ type seriesServer struct {
 	storepb.Store_SeriesServer
 	ctx context.Context
 
+	smtx      sync.Mutex
 	seriesSet []storepb.Series
 	warnings  []string
 }
 
 func (s *seriesServer) Send(r *storepb.SeriesResponse) error {
+	s.smtx.Lock()
+	defer s.smtx.Unlock()
+
 	if r.GetWarning() != "" {
 		s.warnings = append(s.warnings, r.GetWarning())
 		return nil
@@ -255,6 +260,10 @@ func (q *querier) Select(_ bool, hints *storage.SelectHints, ms ...*labels.Match
 	}}
 }
 
+type timerange struct {
+	mintime, maxtime int64
+}
+
 func (q *querier) selectFn(ctx context.Context, hints *storage.SelectHints, ms ...*labels.Matcher) (storage.SeriesSet, error) {
 	sms, err := storepb.PromMatchersToMatchers(ms...)
 	if err != nil {
@@ -268,9 +277,30 @@ func (q *querier) selectFn(ctx context.Context, hints *storage.SelectHints, ms .
 
 	// TODO(bwplotka): Use inprocess gRPC.
 	resp := &seriesServer{ctx: ctx}
+
+	timeranges := []timerange{}
+	if hints.Range != 0 && hints.Range < hints.Step {
+		for ts := hints.Start; ts <= hints.End; ts += hints.Step {
+			timeranges = append(timeranges, timerange{ts, ts + hints.Range})
+		}
+	} else {
+		timeranges = append(timeranges, timerange{
+			hints.Start, hints.End,
+		})
+	}
+
+	timerangesToStorepb := func(trs []timerange) []storepb.TimeRange {
+		ret := []storepb.TimeRange{}
+		for _, tr := range trs {
+			ret = append(ret, storepb.TimeRange{MinTime: tr.mintime, MaxTime: tr.maxtime})
+		}
+		return ret
+	}
+
 	if err := q.proxy.Series(&storepb.SeriesRequest{
 		MinTime:                 hints.Start,
 		MaxTime:                 hints.End,
+		Timeranges:              timerangesToStorepb(timeranges),
 		Matchers:                sms,
 		MaxResolutionWindow:     q.maxResolutionMillis,
 		Aggregates:              aggrs,
