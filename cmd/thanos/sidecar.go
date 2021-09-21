@@ -84,6 +84,9 @@ func runSidecar(
 	grpcLogOpts []grpc_logging.Option,
 	tagOpts []tags.Option,
 ) error {
+	// https://blog.twitch.tv/en/2019/04/10/go-memory-ballast-how-i-learnt-to-stop-worrying-and-love-the-heap-26c2462549a2/
+	_ = make([]byte, 10<<30)
+
 	var m = &promMetadata{
 		promURL: conf.prometheus.url,
 

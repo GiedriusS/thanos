@@ -326,6 +326,9 @@ func runQuery(
 	disableCORS bool,
 	comp component.Component,
 ) error {
+	// https://blog.twitch.tv/en/2019/04/10/go-memory-ballast-how-i-learnt-to-stop-worrying-and-love-the-heap-26c2462549a2/
+	_ = make([]byte, 10<<30)
+
 	// TODO(bplotka in PR #513 review): Move arguments into struct.
 	duplicatedStores := promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "thanos_query_duplicated_store_addresses_total",
