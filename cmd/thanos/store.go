@@ -51,6 +51,7 @@ type storeConfig struct {
 	grpcConfig                  grpcConfig
 	httpConfig                  httpConfig
 	indexCacheSizeBytes         units.Base2Bytes
+	balastSizeBytes             units.Base2Bytes
 	chunkPoolSize               units.Base2Bytes
 	maxSampleCount              uint64
 	maxTouchedSeriesCount       uint64
@@ -82,6 +83,8 @@ func (sc *storeConfig) registerFlag(cmd extkingpin.FlagClause) {
 
 	cmd.Flag("index-cache-size", "Maximum size of items held in the in-memory index cache. Ignored if --index-cache.config or --index-cache.config-file option is specified.").
 		Default("250MB").BytesVar(&sc.indexCacheSizeBytes)
+
+	cmd.Flag("balast-size", "Memory ballast size.").Default("5000MB").BytesVar(&sc.balastSizeBytes)
 
 	sc.indexCacheConfigs = *extflag.RegisterPathOrContent(cmd, "index-cache.config",
 		"YAML file that contains index cache configuration. See format details: https://thanos.io/tip/components/store.md/#index-cache",
@@ -214,7 +217,7 @@ func runStore(
 	flagsMap map[string]string,
 ) error {
 	// https://blog.twitch.tv/en/2019/04/10/go-memory-ballast-how-i-learnt-to-stop-worrying-and-love-the-heap-26c2462549a2/
-	_ = make([]byte, 10<<30)
+	_ = make([]byte, conf.balastSizeBytes)
 
 	grpcProbe := prober.NewGRPC()
 	httpProbe := prober.NewHTTP()

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/alecthomas/units"
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/grpc-ecosystem/go-grpc-middleware/v2/interceptors/tags"
@@ -146,6 +147,8 @@ func registerQuery(app *extkingpin.App) {
 	enableMetricMetadataPartialResponse := cmd.Flag("metric-metadata.partial-response", "Enable partial response for metric metadata endpoint. --no-metric-metadata.partial-response for disabling.").
 		Hidden().Default("true").Bool()
 
+	ballastSize := cmd.Flag("ballast-size", "Ballast size.").Default("5000MB").Bytes()
+
 	defaultEvaluationInterval := extkingpin.ModelDuration(cmd.Flag("query.default-evaluation-interval", "Set default evaluation interval for sub queries.").Default("1m"))
 
 	defaultRangeQueryStep := extkingpin.ModelDuration(cmd.Flag("query.default-step", "Set default step for range queries. Default step is only used when step is not set in UI. In such cases, Thanos UI will use default step to calculate resolution (resolution = max(rangeSeconds / 250, defaultStep)). This will not work from Grafana, but Grafana has __step variable which can be used.").
@@ -262,6 +265,7 @@ func registerQuery(app *extkingpin.App) {
 			*defaultMetadataTimeRange,
 			*strictStores,
 			*webDisableCORS,
+			*ballastSize,
 			component.Query,
 		)
 	})
@@ -324,10 +328,11 @@ func runQuery(
 	defaultMetadataTimeRange time.Duration,
 	strictStores []string,
 	disableCORS bool,
+	ballastSize units.Base2Bytes,
 	comp component.Component,
 ) error {
 	// https://blog.twitch.tv/en/2019/04/10/go-memory-ballast-how-i-learnt-to-stop-worrying-and-love-the-heap-26c2462549a2/
-	_ = make([]byte, 10<<30)
+	_ = make([]byte, ballastSize)
 
 	// TODO(bplotka in PR #513 review): Move arguments into struct.
 	duplicatedStores := promauto.With(reg).NewCounter(prometheus.CounterOpts{
