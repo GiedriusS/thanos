@@ -743,6 +743,36 @@ func (s *bucketSeriesSet) Err() error {
 	return s.err
 }
 
+func preloadSeries(
+	ctx context.Context,
+	matchers []*labels.Matcher,
+	seriesLimiter SeriesLimiter,
+	indexr *bucketIndexReader,
+) ([]uint64, error) {
+	ps, err := indexr.ExpandedPostings(ctx, matchers)
+	if err != nil {
+		return nil, errors.Wrap(err, "expanded matching posting")
+	}
+
+	if len(ps) == 0 {
+		return ps, nil
+	}
+
+	// Reserve series seriesLimiter
+	if err := seriesLimiter.Reserve(uint64(len(ps))); err != nil {
+		return ps, errors.Wrap(err, "exceeded series limit")
+	}
+
+	// Preload all series index data.
+	// TODO(bwplotka): Consider not keeping all series in memory all the time.
+	// TODO(bwplotka): Do lazy loading in one step as `ExpandingPostings` method.
+	if err := indexr.PreloadSeries(ctx, ps); err != nil {
+		return ps, errors.Wrap(err, "preload series")
+	}
+
+	return ps, nil
+}
+
 // blockSeries returns series matching given matchers, that have some data in given time range.
 func blockSeries(
 	ctx context.Context,
@@ -755,28 +785,8 @@ func blockSeries(
 	skipChunks bool, // If true, chunks are not loaded.
 	minTime, maxTime int64, // Series must have data in this time range to be returned.
 	loadAggregates []storepb.Aggr, // List of aggregates to load when loading chunks.
+	postings []uint64, // Preloaded postings according to the matchers.
 ) (storepb.SeriesSet, *queryStats, error) {
-	ps, err := indexr.ExpandedPostings(ctx, matchers)
-	if err != nil {
-		return nil, nil, errors.Wrap(err, "expanded matching posting")
-	}
-
-	if len(ps) == 0 {
-		return storepb.EmptySeriesSet(), indexr.stats, nil
-	}
-
-	// Reserve series seriesLimiter
-	if err := seriesLimiter.Reserve(uint64(len(ps))); err != nil {
-		return nil, nil, errors.Wrap(err, "exceeded series limit")
-	}
-
-	// Preload all series index data.
-	// TODO(bwplotka): Consider not keeping all series in memory all the time.
-	// TODO(bwplotka): Do lazy loading in one step as `ExpandingPostings` method.
-	if err := indexr.PreloadSeries(ctx, ps); err != nil {
-		return nil, nil, errors.Wrap(err, "preload series")
-	}
-
 	// Transform all series into the response types and mark their relevant chunks
 	// for preloading.
 	var (
@@ -785,7 +795,7 @@ func blockSeries(
 		lset           labels.Labels
 		chks           []chunks.Meta
 	)
-	for _, id := range ps {
+	for _, id := range postings {
 		ok, err := indexr.LoadSeriesForTime(id, &symbolizedLset, &chks, skipChunks, minTime, maxTime)
 		if err != nil {
 			return nil, nil, errors.Wrap(err, "read series")
@@ -944,8 +954,20 @@ func debugFoundBlockSetOverview(logger log.Logger, mint, maxt, maxResolutionMill
 	level.Debug(logger).Log("msg", "Blocks source resolutions", "blocks", len(bs), "Maximum Resolution", maxResolutionMillis, "mint", mint, "maxt", maxt, "lset", lset.String(), "spans", strings.Join(parts, "\n"))
 }
 
+var emptyPostingsSentinelErr = errors.New("no matching postings")
+
+type preloadedSeries struct {
+	doPreload sync.Once
+	postings  []uint64
+}
+
 // Series implements the storepb.StoreServer interface.
 func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_SeriesServer) (err error) {
+	var preloadErr error
+
+	pSeriesMtx := &sync.Mutex{}
+	pSeries := map[string]preloadedSeries{}
+
 	if s.queryGate != nil {
 		tracing.DoInSpan(srv.Context(), "store_query_gate_ismyturn", func(ctx context.Context) {
 			err = s.queryGate.Start(srv.Context())
@@ -961,8 +983,20 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
-	req.MinTime = s.limitMinTime(req.MinTime)
-	req.MaxTime = s.limitMaxTime(req.MaxTime)
+
+	timeRanges := []storepb.TimeRange{
+		{
+			MinTime: s.limitMinTime(req.MinTime),
+			MaxTime: s.limitMaxTime(req.MaxTime),
+		},
+	}
+	if req.Timeranges != nil {
+		timeRanges = req.Timeranges
+		for _, tr := range timeRanges {
+			tr.MinTime = s.limitMinTime(tr.MinTime)
+			tr.MaxTime = s.limitMinTime(tr.MaxTime)
+		}
+	}
 
 	var (
 		ctx              = srv.Context()
@@ -994,69 +1028,104 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 		if !ok {
 			continue
 		}
+		for _, tr := range timeRanges {
+			blocks := bs.getFor(tr.MinTime, tr.MaxTime, req.MaxResolutionWindow, reqBlockMatchers)
 
-		blocks := bs.getFor(req.MinTime, req.MaxTime, req.MaxResolutionWindow, reqBlockMatchers)
-
-		if s.debugLogging {
-			debugFoundBlockSetOverview(s.logger, req.MinTime, req.MaxTime, req.MaxResolutionWindow, bs.labels, blocks)
-		}
-
-		for _, b := range blocks {
-			b := b
-			gctx := gctx
-
-			if s.enableSeriesResponseHints {
-				// Keep track of queried blocks.
-				resHints.AddQueriedBlock(b.meta.ULID)
+			if s.debugLogging {
+				debugFoundBlockSetOverview(s.logger, tr.MinTime, tr.MaxTime, req.MaxResolutionWindow, bs.labels, blocks)
 			}
 
-			var chunkr *bucketChunkReader
-			// We must keep the readers open until all their data has been sent.
-			indexr := b.indexReader()
-			if !req.SkipChunks {
-				chunkr = b.chunkReader()
-				defer runutil.CloseWithLogOnErr(s.logger, chunkr, "series block")
-			}
+			for _, b := range blocks {
+				b := b
+				gctx := gctx
 
-			// Defer all closes to the end of Series method.
-			defer runutil.CloseWithLogOnErr(s.logger, indexr, "series block")
-
-			g.Go(func() error {
-				span, newCtx := tracing.StartSpan(gctx, "bucket_store_block_series", tracing.Tags{
-					"block.id":         b.meta.ULID,
-					"block.mint":       b.meta.MinTime,
-					"block.maxt":       b.meta.MaxTime,
-					"block.resolution": b.meta.Thanos.Downsample.Resolution,
-				})
-				defer span.Finish()
-
-				part, pstats, err := blockSeries(
-					newCtx,
-					b.extLset,
-					indexr,
-					chunkr,
-					blockMatchers,
-					chunksLimiter,
-					seriesLimiter,
-					req.SkipChunks,
-					req.MinTime, req.MaxTime,
-					req.Aggregates,
-				)
-				if err != nil {
-					return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
+				if s.enableSeriesResponseHints {
+					// Keep track of queried blocks.
+					resHints.AddQueriedBlock(b.meta.ULID)
 				}
 
-				mtx.Lock()
-				res = append(res, part)
-				stats = stats.merge(pstats)
-				mtx.Unlock()
+				var chunkr *bucketChunkReader
+				// We must keep the readers open until all their data has been sent.
+				indexr := b.indexReader()
+				if !req.SkipChunks {
+					chunkr = b.chunkReader()
+					defer runutil.CloseWithLogOnErr(s.logger, chunkr, "series block")
+				}
 
-				// No info about samples exactly, so pass at least chunks.
-				span.SetTag("processed.series", len(indexr.loadedSeries))
-				span.SetTag("processed.chunks", pstats.chunksFetched)
-				return nil
-			})
+				// Defer all closes to the end of Series method.
+				defer runutil.CloseWithLogOnErr(s.logger, indexr, "series block")
+
+				g.Go(func() error {
+					span, newCtx := tracing.StartSpan(gctx, "bucket_store_block_series", tracing.Tags{
+						"block.id":         b.meta.ULID,
+						"block.mint":       b.meta.MinTime,
+						"block.maxt":       b.meta.MaxTime,
+						"block.resolution": b.meta.Thanos.Downsample.Resolution,
+					})
+					defer span.Finish()
+
+					// Preload postings only once across possibly multiple timeranges.
+					pSeriesMtx.Lock()
+					loader, ok := pSeries[b.meta.ULID.String()]
+					if !ok {
+						pSeries[b.meta.ULID.String()] = preloadedSeries{
+							doPreload: sync.Once{},
+						}
+						loader = pSeries[b.meta.ULID.String()]
+					}
+					pSeriesMtx.Unlock()
+
+					loader.doPreload.Do(func() {
+						ps, err := preloadSeries(ctx, matchers, seriesLimiter, indexr)
+						if err != nil {
+							preloadErr = err
+							return
+						}
+						loader.postings = ps
+					})
+
+					var part storepb.SeriesSet
+					var pstats *queryStats
+					var err error
+
+					switch preloadErr {
+					case emptyPostingsSentinelErr:
+						part, pstats, err = storepb.EmptySeriesSet(), indexr.stats, nil
+					case nil:
+						part, pstats, err = blockSeries(
+							newCtx,
+							b.extLset,
+							indexr,
+							chunkr,
+							blockMatchers,
+							chunksLimiter,
+							seriesLimiter,
+							req.SkipChunks,
+							tr.MinTime, tr.MaxTime,
+							req.Aggregates,
+							loader.postings,
+						)
+					default:
+						return errors.Wrapf(preloadErr, "fetch series for block %s", b.meta.ULID)
+					}
+
+					if err != nil {
+						return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
+					}
+
+					mtx.Lock()
+					res = append(res, part)
+					stats = stats.merge(pstats)
+					mtx.Unlock()
+
+					// No info about samples exactly, so pass at least chunks.
+					span.SetTag("processed.series", len(indexr.loadedSeries))
+					span.SetTag("processed.chunks", pstats.chunksFetched)
+					return nil
+				})
+			}
 		}
+
 	}
 
 	s.mtx.RUnlock()
@@ -1242,7 +1311,11 @@ func (s *BucketStore) LabelNames(ctx context.Context, req *storepb.LabelNamesReq
 
 				result = strutil.MergeSlices(res, extRes)
 			} else {
-				seriesSet, _, err := blockSeries(newCtx, b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil)
+				ps, err := preloadSeries(ctx, reqSeriesMatchers, seriesLimiter, indexr)
+				if err != nil {
+					return err
+				}
+				seriesSet, _, err := blockSeries(newCtx, b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil, ps)
 				if err != nil {
 					return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
 				}
@@ -1373,7 +1446,11 @@ func (s *BucketStore) LabelValues(ctx context.Context, req *storepb.LabelValuesR
 				}
 				result = res
 			} else {
-				seriesSet, _, err := blockSeries(newCtx, b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil)
+				ps, err := preloadSeries(ctx, reqSeriesMatchers, seriesLimiter, indexr)
+				if err != nil {
+					return err
+				}
+				seriesSet, _, err := blockSeries(newCtx, b.extLset, indexr, nil, reqSeriesMatchers, nil, seriesLimiter, true, req.Start, req.End, nil, ps)
 				if err != nil {
 					return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
 				}
