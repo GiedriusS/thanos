@@ -961,8 +961,20 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 	if err != nil {
 		return status.Error(codes.InvalidArgument, err.Error())
 	}
-	req.MinTime = s.limitMinTime(req.MinTime)
-	req.MaxTime = s.limitMaxTime(req.MaxTime)
+
+	timeRanges := []storepb.TimeRange{
+		{
+			MinTime: s.limitMinTime(req.MinTime),
+			MaxTime: s.limitMaxTime(req.MaxTime),
+		},
+	}
+	if req.Timeranges != nil {
+		timeRanges = req.Timeranges
+		for _, tr := range timeRanges {
+			tr.MinTime = s.limitMinTime(tr.MinTime)
+			tr.MaxTime = s.limitMinTime(tr.MaxTime)
+		}
+	}
 
 	var (
 		ctx              = srv.Context()
@@ -994,69 +1006,71 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, srv storepb.Store_Serie
 		if !ok {
 			continue
 		}
+		for _, tr := range timeRanges {
+			blocks := bs.getFor(tr.MinTime, tr.MaxTime, req.MaxResolutionWindow, reqBlockMatchers)
 
-		blocks := bs.getFor(req.MinTime, req.MaxTime, req.MaxResolutionWindow, reqBlockMatchers)
-
-		if s.debugLogging {
-			debugFoundBlockSetOverview(s.logger, req.MinTime, req.MaxTime, req.MaxResolutionWindow, bs.labels, blocks)
-		}
-
-		for _, b := range blocks {
-			b := b
-			gctx := gctx
-
-			if s.enableSeriesResponseHints {
-				// Keep track of queried blocks.
-				resHints.AddQueriedBlock(b.meta.ULID)
+			if s.debugLogging {
+				debugFoundBlockSetOverview(s.logger, tr.MinTime, tr.MaxTime, req.MaxResolutionWindow, bs.labels, blocks)
 			}
 
-			var chunkr *bucketChunkReader
-			// We must keep the readers open until all their data has been sent.
-			indexr := b.indexReader()
-			if !req.SkipChunks {
-				chunkr = b.chunkReader()
-				defer runutil.CloseWithLogOnErr(s.logger, chunkr, "series block")
-			}
+			for _, b := range blocks {
+				b := b
+				gctx := gctx
 
-			// Defer all closes to the end of Series method.
-			defer runutil.CloseWithLogOnErr(s.logger, indexr, "series block")
-
-			g.Go(func() error {
-				span, newCtx := tracing.StartSpan(gctx, "bucket_store_block_series", tracing.Tags{
-					"block.id":         b.meta.ULID,
-					"block.mint":       b.meta.MinTime,
-					"block.maxt":       b.meta.MaxTime,
-					"block.resolution": b.meta.Thanos.Downsample.Resolution,
-				})
-				defer span.Finish()
-
-				part, pstats, err := blockSeries(
-					newCtx,
-					b.extLset,
-					indexr,
-					chunkr,
-					blockMatchers,
-					chunksLimiter,
-					seriesLimiter,
-					req.SkipChunks,
-					req.MinTime, req.MaxTime,
-					req.Aggregates,
-				)
-				if err != nil {
-					return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
+				if s.enableSeriesResponseHints {
+					// Keep track of queried blocks.
+					resHints.AddQueriedBlock(b.meta.ULID)
 				}
 
-				mtx.Lock()
-				res = append(res, part)
-				stats = stats.merge(pstats)
-				mtx.Unlock()
+				var chunkr *bucketChunkReader
+				// We must keep the readers open until all their data has been sent.
+				indexr := b.indexReader()
+				if !req.SkipChunks {
+					chunkr = b.chunkReader()
+					defer runutil.CloseWithLogOnErr(s.logger, chunkr, "series block")
+				}
 
-				// No info about samples exactly, so pass at least chunks.
-				span.SetTag("processed.series", len(indexr.loadedSeries))
-				span.SetTag("processed.chunks", pstats.chunksFetched)
-				return nil
-			})
+				// Defer all closes to the end of Series method.
+				defer runutil.CloseWithLogOnErr(s.logger, indexr, "series block")
+
+				g.Go(func() error {
+					span, newCtx := tracing.StartSpan(gctx, "bucket_store_block_series", tracing.Tags{
+						"block.id":         b.meta.ULID,
+						"block.mint":       b.meta.MinTime,
+						"block.maxt":       b.meta.MaxTime,
+						"block.resolution": b.meta.Thanos.Downsample.Resolution,
+					})
+					defer span.Finish()
+
+					part, pstats, err := blockSeries(
+						newCtx,
+						b.extLset,
+						indexr,
+						chunkr,
+						blockMatchers,
+						chunksLimiter,
+						seriesLimiter,
+						req.SkipChunks,
+						tr.MinTime, tr.MaxTime,
+						req.Aggregates,
+					)
+					if err != nil {
+						return errors.Wrapf(err, "fetch series for block %s", b.meta.ULID)
+					}
+
+					mtx.Lock()
+					res = append(res, part)
+					stats = stats.merge(pstats)
+					mtx.Unlock()
+
+					// No info about samples exactly, so pass at least chunks.
+					span.SetTag("processed.series", len(indexr.loadedSeries))
+					span.SetTag("processed.chunks", pstats.chunksFetched)
+					return nil
+				})
+			}
 		}
+
 	}
 
 	s.mtx.RUnlock()
