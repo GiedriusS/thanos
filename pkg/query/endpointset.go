@@ -701,7 +701,7 @@ func (er *endpointRef) HasQueryAPI() bool {
 	er.mtx.RLock()
 	defer er.mtx.RUnlock()
 
-	return er.HasClients() && er.clients.query != nil
+	return er.clients != nil && er.clients.query != nil
 }
 
 func (er *endpointRef) HasMetricMetadataAPI() bool {
