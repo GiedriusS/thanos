@@ -1770,7 +1770,12 @@ func benchProxySeries(t testutil.TB, totalSamples, totalSeries int) {
 	}
 
 	chunkLen := len(allResps[len(allResps)-1].GetSeries().Chunks)
-	maxTime := allResps[len(allResps)-1].GetSeries().Chunks[chunkLen-1].MaxTime
+	var maxTime int64
+	if chunkLen == 0 {
+		maxTime = math.MaxInt64
+	} else {
+		maxTime = allResps[len(allResps)-1].GetSeries().Chunks[chunkLen-1].MaxTime
+	}
 	storetestutil.TestServerSeries(t, store,
 		&storetestutil.SeriesCase{
 			Name: fmt.Sprintf("%d client with %d samples, %d series each", numOfClients, samplesPerSeriesPerClient, seriesPerClient),
