@@ -166,6 +166,8 @@ func registerQuery(app *extkingpin.App) {
 	storeResponseTimeout := extkingpin.ModelDuration(cmd.Flag("store.response-timeout", "If a Store doesn't send any data in this specified duration then a Store will be ignored and partial data will be returned if it's enabled. 0 disables timeout.").Default("0ms"))
 	reqLogConfig := extkingpin.RegisterRequestLoggingFlags(cmd)
 
+	alertQueryURL := cmd.Flag("alert.query-url", "The external Thanos Query URL that would be set in all alerts 'Source' field.").String()
+
 	cmd.Setup(func(g *run.Group, logger log.Logger, reg *prometheus.Registry, tracer opentracing.Tracer, _ <-chan struct{}, _ bool) error {
 		selectorLset, err := parseFlagLabels(*selectorLabels)
 		if err != nil {
@@ -291,6 +293,7 @@ func registerQuery(app *extkingpin.App) {
 			enableAtModifier,
 			enableNegativeOffset,
 			enableStorePushdown,
+			*alertQueryURL,
 			component.Query,
 		)
 	})
@@ -357,8 +360,16 @@ func runQuery(
 	enableAtModifier bool,
 	enableNegativeOffset bool,
 	enableStorePushdown bool,
+	alertQueryURL string,
 	comp component.Component,
 ) error {
+	if alertQueryURL == "" {
+		lastColon := strings.LastIndex(httpBindAddr, ":")
+		if lastColon != -1 {
+			alertQueryURL = fmt.Sprintf("http://localhost:%s", httpBindAddr[lastColon+1:])
+		}
+		// NOTE(GiedriusS): default is set in config.ts.
+	}
 	// TODO(bplotka in PR #513 review): Move arguments into struct.
 	duplicatedStores := promauto.With(reg).NewCounter(prometheus.CounterOpts{
 		Name: "thanos_query_duplicated_store_addresses_total",
@@ -572,7 +583,7 @@ func runQuery(
 
 		ins := extpromhttp.NewInstrumentationMiddleware(reg, nil)
 		// TODO(bplotka in PR #513 review): pass all flags, not only the flags needed by prefix rewriting.
-		ui.NewQueryUI(logger, endpoints, webExternalPrefix, webPrefixHeaderName).Register(router, ins)
+		ui.NewQueryUI(logger, endpoints, webExternalPrefix, webPrefixHeaderName, alertQueryURL).Register(router, ins)
 
 		var pushdownAdapter *pushdown.TimeBasedPushdown
 

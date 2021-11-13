@@ -20,6 +20,16 @@ We use *breaking :warning:* to mark changes that are not backward compatible (re
 - [#4679](https://github.com/thanos-io/thanos/pull/4679) Added `enable-feature` flag to enable negative offsets and @ modifier, similar to Prometheus.
 - [#4696](https://github.com/thanos-io/thanos/pull/4696) Query: add cache name to tracing spans.
 - [#4712](https://github.com/thanos-io/thanos/pull/4712) Query/Store: added experimental feature `store-pushdown` and corresponding flags to Thanos Store. You can enable it with `--enable-feature` on Thanos Query. Currently it makes Thanos Query push down a query to a leaf node if it is the only one matching the provided time range via the API. It should cover most cases where Sidecar/Ruler/Receive is responsible for a few days of data, and the rest of the data is covered by load-balanced Thanos Stores. Ad-hoc tests show a decrease of up to 50% in duration of queries which touch lots of time series because it is not necessary anymore to transfer all of them over the wire.
+- [#4710](https://github.com/thanos-io/thanos/pull/4710) Store: add metric to capture timestamp of the last loaded block.
+- [#4736](https://github.com/thanos-io/thanos/pull/4736) S3: Add capability to use custom AWS STS Endpoint.
+- [#4764](https://github.com/thanos-io/thanos/pull/4764) Compactor: add `block-viewer.global.sync-block-timeout` flag to set the timeout of synchronization block metas.
+- [#4801](https://github.com/thanos-io/thanos/pull/4801) Compactor: added Prometheus metrics for tracking the progress of compaction and downsampling.
+- [#4444](https://github.com/thanos-io/thanos/pull/4444) UI: add mark deletion and no compaction to the Block UI.
+- [#4576](https://github.com/thanos-io/thanos/pull/4576) UI: add filter compaction level to the Block UI.
+- [#4731](https://github.com/thanos-io/thanos/pull/4731) Rule: add stateless mode to ruler according to https://thanos.io/tip/proposals-accepted/202005-scalable-rule-storage.md/. Continue https://github.com/thanos-io/thanos/pull/4250.
+- [#4612](https://github.com/thanos-io/thanos/pull/4612) Sidecar: add `--prometheus.http-client` and `--prometheus.http-client-file` flag for sidecar to connect Prometheus with basic auth or TLS.
+- [#4847](https://github.com/thanos-io/thanos/pull/4847) Query: add `--alert.query-url` which is used in the user interface for rules/alerts pages. By default the HTTP listen address is used for this URL.
+- [#4856](https://github.com/thanos-io/thanos/pull/4856) Mixin: Add Query Frontend Grafana dashboard.
 
 ### Fixed
 
