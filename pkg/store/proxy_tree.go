@@ -4,8 +4,6 @@
 package store
 
 import (
-	"fmt"
-
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 )
@@ -165,20 +163,21 @@ func (t *ProxyTournamentTree) Fix() {
 			rightIdx = t.lastChangedNodeIndex
 		}
 
-		// Automatic victory by right or left.
-		if leftIdx >= 0 && rightIdx < len(t.nodes) && t.nodes[rightIdx] == nil && t.nodes[leftIdx] == nil {
+		// Deduce the winner (loser).
+		if (leftIdx >= 0 && rightIdx < len(t.nodes) && t.nodes[rightIdx] == nil && t.nodes[leftIdx] == nil) ||
+			(leftIdx >= 0 && rightIdx >= len(t.nodes) && t.nodes[leftIdx] == nil) {
 			t.auxiliaryNodes[auxNodeIndex] = nil
-		} else if leftIdx < 0 || t.nodes[leftIdx] == nil {
-			t.auxiliaryNodes[auxNodeIndex] = &treeAuxNode{
-				ss:                t.nodes[rightIdx],
-				previousAuxIndex:  -1,
-				previousNodeIndex: rightIdx,
-			}
 		} else if rightIdx >= len(t.nodes) || t.nodes[rightIdx] == nil {
 			t.auxiliaryNodes[auxNodeIndex] = &treeAuxNode{
 				ss:                t.nodes[leftIdx],
 				previousAuxIndex:  -1,
 				previousNodeIndex: leftIdx,
+			}
+		} else if leftIdx < 0 || t.nodes[leftIdx] == nil {
+			t.auxiliaryNodes[auxNodeIndex] = &treeAuxNode{
+				ss:                t.nodes[rightIdx],
+				previousAuxIndex:  -1,
+				previousNodeIndex: rightIdx,
 			}
 		} else {
 			leftSS := t.nodes[leftIdx].At().Labels()
@@ -207,9 +206,57 @@ func (t *ProxyTournamentTree) Fix() {
 			nodesInLevel = 1 + (nodesInLevel / 2)
 		}
 
+		// Already done after the first iter.
+		if nodesInLevel == 1 {
+			return
+		}
+
 		for {
-			fmt.Println(nodesInLevel)
 			// Do actions with that level.
+
+			if auxNodeIndex%2 == 0 {
+				leftIdx = auxNodeIndex
+				rightIdx = auxNodeIndex + 1
+			} else {
+				leftIdx = auxNodeIndex - 1
+				rightIdx = auxNodeIndex
+			}
+			auxNodeIndex = nodesInLevel + (auxNodeIndex / 2)
+
+			if (leftIdx >= 0 && rightIdx < len(t.auxiliaryNodes) && t.auxiliaryNodes[rightIdx] == nil && t.auxiliaryNodes[leftIdx] == nil) ||
+				(leftIdx >= 0 && rightIdx >= len(t.auxiliaryNodes) && t.auxiliaryNodes[leftIdx] == nil) {
+			} else if rightIdx >= len(t.auxiliaryNodes) || t.auxiliaryNodes[rightIdx] == nil {
+				t.auxiliaryNodes[auxNodeIndex] = &treeAuxNode{
+					ss:                t.auxiliaryNodes[leftIdx].ss,
+					previousAuxIndex:  leftIdx,
+					previousNodeIndex: -1,
+				}
+			} else if leftIdx < 0 || t.auxiliaryNodes[leftIdx] == nil {
+				t.auxiliaryNodes[auxNodeIndex] = &treeAuxNode{
+					ss:                t.auxiliaryNodes[rightIdx].ss,
+					previousAuxIndex:  rightIdx,
+					previousNodeIndex: -1,
+				}
+			} else {
+				leftSS := t.auxiliaryNodes[leftIdx].ss.At().Labels()
+				rightSS := t.auxiliaryNodes[rightIdx].ss.At().Labels()
+
+				if labels.Compare(leftSS, rightSS) < 0 {
+					t.auxiliaryNodes[auxNodeIndex] = &treeAuxNode{
+						ss:                t.auxiliaryNodes[leftIdx].ss,
+						previousAuxIndex:  leftIdx,
+						previousNodeIndex: -1,
+					}
+				} else {
+					t.auxiliaryNodes[auxNodeIndex] = &treeAuxNode{
+						ss:                t.auxiliaryNodes[rightIdx].ss,
+						previousAuxIndex:  rightIdx,
+						previousNodeIndex: -1,
+					}
+				}
+			}
+
+			// Start other.
 			if nodesInLevel%2 == 0 {
 				nodesInLevel = nodesInLevel / 2
 			} else {
@@ -219,11 +266,6 @@ func (t *ProxyTournamentTree) Fix() {
 				break
 			}
 		}
-
-		// x x x x
-		// y y b
-
-		//
 	}
 }
 
@@ -236,9 +278,11 @@ func (t *ProxyTournamentTree) Pop() storage.SeriesSet {
 
 		for {
 			if curNode.previousAuxIndex != -1 {
-				curNode = t.auxiliaryNodes[curNode.previousAuxIndex]
-				t.auxiliaryNodes[curNodeIdx] = nil
+				oldNodeIdx := curNodeIdx
 				curNodeIdx = curNode.previousAuxIndex
+
+				curNode = t.auxiliaryNodes[curNode.previousAuxIndex]
+				t.auxiliaryNodes[oldNodeIdx] = nil
 				continue
 			}
 			if curNode.previousNodeIndex != -1 {

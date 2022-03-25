@@ -50,41 +50,97 @@ func (s *mockSeries) Labels() labels.Labels {
 }
 
 func TestTournamentTreePop(t *testing.T) {
-	tt := NewProxyTournamentTree(
-		[]storage.SeriesSet{
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "test",
-							Value: "baa",
+	// Tree of size 2.
+	{
+		tt := NewProxyTournamentTree(
+			[]storage.SeriesSet{
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "baa",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "bab",
+							},
 						},
 					},
 				},
 			},
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "test",
-							Value: "bab",
+		)
+
+		ssLbls := tt.Pop().At().Labels()
+		testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "baa"}}, ssLbls)
+
+		tt.Fix()
+		ssLbls = tt.Pop().At().Labels()
+		testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "bab"}}, ssLbls)
+
+		tt.Fix()
+		ss := tt.Pop()
+		testutil.Equals(t, nil, ss)
+	}
+
+	// Tree of size 3.
+	{
+		tt := NewProxyTournamentTree(
+			[]storage.SeriesSet{
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "baa",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "bab",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "caa",
+							},
 						},
 					},
 				},
 			},
-		},
-	)
+		)
 
-	ssLbls := tt.Pop().At().Labels()
-	testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "baa"}}, ssLbls)
+		ssLbls := tt.Pop().At().Labels()
+		testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "baa"}}, ssLbls)
 
-	tt.Fix()
-	ssLbls = tt.Pop().At().Labels()
-	testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "bab"}}, ssLbls)
+		tt.Fix()
+		ssLbls = tt.Pop().At().Labels()
+		testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "bab"}}, ssLbls)
 
-	tt.Fix()
-	ss := tt.Pop()
-	testutil.Equals(t, nil, ss)
+		tt.Fix()
+		ssLbls = tt.Pop().At().Labels()
+		testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "caa"}}, ssLbls)
+
+		tt.Fix()
+		ss := tt.Pop()
+		testutil.Equals(t, nil, ss)
+	}
 }
 
 func TestTournamentTreeBuild(t *testing.T) {
