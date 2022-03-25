@@ -18,9 +18,8 @@ type mockSeriesSet struct {
 }
 
 func (m *mockSeriesSet) Next() bool {
-	ret := m.i < len(m.series)
 	m.i++
-	return ret
+	return m.i < len(m.series)
 }
 
 func (m *mockSeriesSet) Err() error {
@@ -32,6 +31,9 @@ func (m *mockSeriesSet) Warnings() storage.Warnings {
 }
 
 func (m *mockSeriesSet) At() storage.Series {
+	if m.i >= len(m.series) {
+		return nil
+	}
 	return &mockSeries{lbls: m.series[m.i]}
 }
 
@@ -47,113 +49,187 @@ func (s *mockSeries) Labels() labels.Labels {
 	return s.lbls
 }
 
+func TestTournamentTreePop(t *testing.T) {
+	tt := NewProxyTournamentTree(
+		[]storage.SeriesSet{
+			&mockSeriesSet{
+				series: []labels.Labels{
+					{
+						labels.Label{
+							Name:  "test",
+							Value: "baa",
+						},
+					},
+				},
+			},
+			&mockSeriesSet{
+				series: []labels.Labels{
+					{
+						labels.Label{
+							Name:  "test",
+							Value: "bab",
+						},
+					},
+				},
+			},
+		},
+	)
+
+	ssLbls := tt.Pop().At().Labels()
+	testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "baa"}}, ssLbls)
+
+	tt.Fix()
+	ssLbls = tt.Pop().At().Labels()
+	testutil.Equals(t, labels.Labels{labels.Label{Name: "test", Value: "bab"}}, ssLbls)
+
+	tt.Fix()
+	ss := tt.Pop()
+	testutil.Equals(t, nil, ss)
+}
+
 func TestTournamentTreeBuild(t *testing.T) {
-	// Tree of size 5.
-	{
-		tt := NewProxyTournamentTree([]storage.SeriesSet{
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "aaa",
-							Value: "aaa",
+	for _, tcase := range []struct {
+		series      []storage.SeriesSet
+		lenAuxNodes int
+		loser       labels.Labels
+	}{
+		{
+			series: []storage.SeriesSet{
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "baa",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "bab",
+							},
 						},
 					},
 				},
 			},
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "aaa",
-							Value: "bbb",
+			lenAuxNodes: 1,
+			loser: labels.Labels{
+				labels.Label{
+					Name:  "test",
+					Value: "baa",
+				},
+			},
+		},
+		{
+			series: []storage.SeriesSet{
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "aaa",
+								Value: "aaa",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "aaa",
+								Value: "bbb",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "ddd",
+								Value: "eee",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "ddd",
+								Value: "fff",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "ddd",
+								Value: "ggg",
+							},
 						},
 					},
 				},
 			},
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "ddd",
-							Value: "eee",
+			lenAuxNodes: 6,
+			loser: labels.Labels{
+				labels.Label{
+					Name:  "aaa",
+					Value: "aaa",
+				},
+			},
+		},
+		{
+			series: []storage.SeriesSet{
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "foo",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "bar",
+							},
+						},
+					},
+				},
+				&mockSeriesSet{
+					series: []labels.Labels{
+						{
+							labels.Label{
+								Name:  "test",
+								Value: "baz",
+							},
 						},
 					},
 				},
 			},
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "ddd",
-							Value: "fff",
-						},
-					},
+			lenAuxNodes: 3,
+			loser: labels.Labels{
+				labels.Label{
+					Name:  "test",
+					Value: "bar",
 				},
 			},
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "ddd",
-							Value: "ggg",
-						},
-					},
-				},
-			},
-		})
-		testutil.Equals(t, 6, len(tt.auxiliaryNodes))
-		loser := tt.auxiliaryNodes[5].At().Labels()
-		testutil.Equals(t, labels.Labels{
-			labels.Label{
-				Name:  "aaa",
-				Value: "aaa",
-			},
-		}, loser)
-	}
-
-	// Tree of size 3.
-	{
-		tt := NewProxyTournamentTree([]storage.SeriesSet{
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "test",
-							Value: "foo",
-						},
-					},
-				},
-			},
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "test",
-							Value: "bar",
-						},
-					},
-				},
-			},
-			&mockSeriesSet{
-				series: []labels.Labels{
-					{
-						labels.Label{
-							Name:  "test",
-							Value: "baz",
-						},
-					},
-				},
-			},
-		})
-
-		testutil.Equals(t, 3, len(tt.auxiliaryNodes))
-		loser := tt.auxiliaryNodes[2].At().Labels()
-		testutil.Equals(t, labels.Labels{
-			labels.Label{
-				Name:  "test",
-				Value: "bar",
-			},
-		}, loser)
+		},
+	} {
+		tt := NewProxyTournamentTree(tcase.series)
+		testutil.Equals(t, tcase.lenAuxNodes, len(tt.auxiliaryNodes))
+		loserLabels := tt.auxiliaryNodes[len(tt.auxiliaryNodes)-1].ss.At().Labels()
+		testutil.Equals(t, tcase.loser, loserLabels)
 	}
 }
