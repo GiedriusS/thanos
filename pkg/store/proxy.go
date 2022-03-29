@@ -236,9 +236,110 @@ func (s cancelableRespSender) send(r *storepb.SeriesResponse) {
 	}
 }
 
+func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
+	match, matchers, err := matchesExternalLabels(r.Matchers, s.selectorLabels)
+	if err != nil {
+		return status.Error(codes.InvalidArgument, err.Error())
+	}
+	if !match {
+		return nil
+	}
+	if len(matchers) == 0 {
+		return status.Error(codes.InvalidArgument, errors.New("no matchers specified (excluding selector labels)").Error())
+	}
+	storeMatchers, _ := storepb.PromMatchersToMatchers(matchers...) // Error would be returned by matchesExternalLabels, so skip check.
+
+	g, gctx := errgroup.WithContext(srv.Context())
+
+	storeDebugMsgs := []string{}
+	actualRequest := &storepb.SeriesRequest{
+		MinTime:                 r.MinTime,
+		MaxTime:                 r.MaxTime,
+		Matchers:                storeMatchers,
+		Aggregates:              r.Aggregates,
+		MaxResolutionWindow:     r.MaxResolutionWindow,
+		SkipChunks:              r.SkipChunks,
+		QueryHints:              r.QueryHints,
+		PartialResponseDisabled: r.PartialResponseDisabled,
+	}
+
+	stores := []Client{}
+	for _, st := range s.stores() {
+		// We might be able to skip the store if its meta information indicates it cannot have series matching our query.
+		if ok, reason := storeMatches(gctx, st, r.MinTime, r.MaxTime, matchers...); !ok {
+			storeDebugMsgs = append(storeDebugMsgs, fmt.Sprintf("store %s filtered out: %v", st, reason))
+			continue
+		}
+
+		stores = append(stores, st)
+	}
+
+	responses := make([]struct {
+		responses []*storepb.SeriesResponse
+	}, len(stores))
+
+	for i, st := range stores {
+		st := st
+		i := i
+
+		g.Go(func() error {
+			cl, err := st.Series(gctx, actualRequest)
+			if err != nil {
+				return err
+			}
+			for {
+				resp, err := cl.Recv()
+				if err == nil {
+					responses[i].responses = append(responses[i].responses, resp)
+					continue
+				}
+				if err == io.EOF {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				return nil
+			}
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	seriesSets := []storepb.SeriesSet{}
+	for _, resp := range responses {
+		seriesSets = append(seriesSets, &respSeriesSet{responses: resp.responses})
+	}
+
+	if len(seriesSets) == 0 {
+		return nil
+	}
+
+	tt := NewProxyTournamentTree(seriesSets)
+
+	for {
+		ss := tt.Pop()
+		if ss == nil {
+			return nil
+		}
+
+		mergedSet := storepb.MergeSeriesSets(ss)
+		for mergedSet.Next() {
+			lset, chk := mergedSet.At()
+			if err := srv.Send(storepb.NewSeriesResponse(&storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(lset), Chunks: chk})); err != nil {
+				return err
+			}
+		}
+
+		tt.Fix()
+	}
+}
+
 // Series returns all series for a requested time range and label matcher. Requested series are taken from other
 // stores and proxied to RPC client. NOTE: Resulted data are not trimmed exactly to min and max time range.
-func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
+func (s *ProxyStore) SeriesOld(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
 	// TODO(bwplotka): This should be part of request logger, otherwise it does not make much sense. Also, could be
 	// tiggered by tracing span to reduce cognitive load.
 	reqLogger := log.With(s.logger, "component", "proxy", "request", r.String())
