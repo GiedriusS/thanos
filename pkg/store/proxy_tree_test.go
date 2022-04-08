@@ -4,6 +4,7 @@
 package store
 
 import (
+	"fmt"
 	"math/rand"
 	"sort"
 	"testing"
@@ -376,7 +377,7 @@ func TestTournamentTreePop(t *testing.T) {
 }
 
 func TestTournamentTreeBuild(t *testing.T) {
-	for _, tcase := range []struct {
+	for i, tcase := range []struct {
 		series      []storepb.SeriesSet
 		lenAuxNodes int
 		loser       labels.Labels
@@ -515,9 +516,11 @@ func TestTournamentTreeBuild(t *testing.T) {
 			},
 		},
 	} {
-		tt := NewProxyTournamentTree(tcase.series)
-		testutil.Equals(t, tcase.lenAuxNodes, len(tt.auxiliaryNodes))
-		loserLabels, _ := tt.auxiliaryNodes[len(tt.auxiliaryNodes)-1].ss.At()
-		testutil.Equals(t, tcase.loser, loserLabels)
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			tt := NewProxyTournamentTree(tcase.series)
+			testutil.Equals(t, tcase.lenAuxNodes, len(tt.auxiliaryNodes))
+			loserLabels, _ := tt.auxiliaryNodes[len(tt.auxiliaryNodes)-1].ss.At()
+			testutil.Equals(t, tcase.loser, loserLabels)
+		})
 	}
 }
