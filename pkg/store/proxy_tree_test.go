@@ -102,23 +102,11 @@ func TestTournamentTreeCharacteristics(t *testing.T) {
 
 			total := numberOfNodes * eachNodeLen
 
-			var previous storepb.SeriesSet
-
 			for total > 0 {
 				n := tt.Pop()
 				if n == nil {
 					return false
 				}
-
-				if previous != nil {
-					labelsetA, _ := previous.At()
-					labelsetB, _ := n.At()
-
-					if labels.Compare(labelsetA, labelsetB) > 0 {
-						return false
-					}
-				}
-				previous = n
 
 				tt.Fix()
 				total--

@@ -182,15 +182,7 @@ func (t *ProxyTournamentTree) initialFix() {
 			}
 
 			lastLoserIndex = until
-			if nodesInLevel%2 == 0 {
-				nodesInLevel = nodesInLevel / 2
-			} else {
-				if nodesInLevel == 1 {
-					nodesInLevel = 0
-				} else {
-					nodesInLevel = 1 + (nodesInLevel / 2)
-				}
-			}
+			nodesInLevel = nextLevelNodeCount(nodesInLevel)
 		}
 	}
 }
@@ -198,7 +190,7 @@ func (t *ProxyTournamentTree) initialFix() {
 // Fix fixes the tournament tree order after popping.
 func (t *ProxyTournamentTree) Fix() {
 	if t.lastChangedNodeIndex == -1 {
-		panic("please call Fix() only after popping")
+		panic("BUG: please call Fix() only after Pop()")
 	}
 
 	// Rebuild auxiliary nodes.
@@ -209,16 +201,12 @@ func (t *ProxyTournamentTree) Fix() {
 		t.nodes[t.lastChangedNodeIndex] = infinity
 	}
 
-	nodesInLevel := len(t.nodes)
-	if nodesInLevel%2 == 0 {
-		nodesInLevel = nodesInLevel / 2
-	} else {
-		nodesInLevel = 1 + (nodesInLevel / 2)
-	}
+	nodesInLevel := nextLevelNodeCount(len(t.nodes))
 
-	from, until := 0, nodesInLevel
+	// Inclusive.
+	from, until := 0, nodesInLevel-1
 
-	auxNodeOffset := nodesInLevel / 2
+	auxNodeOffset := t.lastChangedNodeIndex / 2
 
 	var leftIdx, rightIdx int
 
@@ -232,65 +220,89 @@ func (t *ProxyTournamentTree) Fix() {
 
 	lookInNodes := true
 
-	for until <= len(t.auxiliaryNodes) {
-		candidateIdx := from + auxNodeOffset
-
-		var left, right storepb.SeriesSet
+	nilNode := func(i int, lookInNodes bool) bool {
 		if lookInNodes {
-			left = t.nodes[leftIdx]
-			right = t.nodes[rightIdx]
-
+			if i < 0 || i >= len(t.nodes) {
+				return true
+			}
+			return t.nodes[i] == nil || t.nodes[i] == infinity
 		} else {
-			left = t.auxiliaryNodes[leftIdx].ss
-			right = t.auxiliaryNodes[rightIdx].ss
+			if i < 0 || i >= len(t.auxiliaryNodes) {
+				return true
+			}
+			return t.auxiliaryNodes[i] == nil || t.auxiliaryNodes[i].ss == infinity
 		}
+	}
+
+	peekNode := func(i int, lookInNodes bool) storepb.SeriesSet {
+		if lookInNodes {
+			if i < 0 || i >= len(t.nodes) {
+				return infinity
+			}
+			return t.nodes[i]
+		} else {
+			if i < 0 || i >= len(t.auxiliaryNodes) {
+				return infinity
+			}
+			if t.auxiliaryNodes[i] == nil {
+				return infinity
+			}
+			return t.auxiliaryNodes[i].ss
+		}
+	}
+
+	for nodesInLevel > 0 {
+		loserIdx := from + auxNodeOffset
 
 		// Deduce the winner.
-		if right == infinity && left != infinity {
+		if rightIdx >= from || nilNode(rightIdx, lookInNodes) {
 			if lookInNodes {
-				t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
-					ss:                left,
+				t.auxiliaryNodes[loserIdx] = &treeAuxNode{
+					ss:                peekNode(leftIdx, lookInNodes),
 					previousAuxIndex:  -1,
 					previousNodeIndex: leftIdx,
 				}
 			} else {
-				t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
-					ss:                left,
+				t.auxiliaryNodes[loserIdx] = &treeAuxNode{
+					ss:                peekNode(leftIdx, lookInNodes),
 					previousAuxIndex:  leftIdx,
 					previousNodeIndex: -1,
 				}
 			}
-		} else if right != infinity && left == infinity {
+		} else if !nilNode(rightIdx, lookInNodes) && nilNode(leftIdx, lookInNodes) {
 			if lookInNodes {
-				t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
-					ss:                right,
+				t.auxiliaryNodes[loserIdx] = &treeAuxNode{
+					ss:                peekNode(rightIdx, lookInNodes),
 					previousAuxIndex:  -1,
 					previousNodeIndex: rightIdx,
 				}
 			} else {
-				t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
-					ss:                right,
+				t.auxiliaryNodes[loserIdx] = &treeAuxNode{
+					ss:                peekNode(rightIdx, lookInNodes),
 					previousAuxIndex:  rightIdx,
 					previousNodeIndex: -1,
 				}
 			}
-		} else if right == infinity && left == infinity {
-			t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
+		} else if nilNode(rightIdx, lookInNodes) && nilNode(leftIdx, lookInNodes) {
+			t.auxiliaryNodes[loserIdx] = &treeAuxNode{
 				ss: infinity,
 			}
 		} else {
+			left := peekNode(leftIdx, lookInNodes)
+			right := peekNode(rightIdx, lookInNodes)
+
 			lsetLeft, _ := left.At()
 			lsetRight, _ := right.At()
 
 			if labels.Compare(lsetLeft, lsetRight) < 0 {
 				if lookInNodes {
-					t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
+					t.auxiliaryNodes[loserIdx] = &treeAuxNode{
 						ss:                left,
 						previousAuxIndex:  -1,
 						previousNodeIndex: leftIdx,
 					}
 				} else {
-					t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
+					t.auxiliaryNodes[loserIdx] = &treeAuxNode{
 						ss:                left,
 						previousAuxIndex:  leftIdx,
 						previousNodeIndex: -1,
@@ -298,13 +310,13 @@ func (t *ProxyTournamentTree) Fix() {
 				}
 			} else {
 				if lookInNodes {
-					t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
+					t.auxiliaryNodes[loserIdx] = &treeAuxNode{
 						ss:                right,
 						previousAuxIndex:  -1,
 						previousNodeIndex: rightIdx,
 					}
 				} else {
-					t.auxiliaryNodes[candidateIdx] = &treeAuxNode{
+					t.auxiliaryNodes[loserIdx] = &treeAuxNode{
 						ss:                right,
 						previousAuxIndex:  rightIdx,
 						previousNodeIndex: -1,
@@ -313,17 +325,22 @@ func (t *ProxyTournamentTree) Fix() {
 			}
 		}
 
-		if nodesInLevel%2 == 0 {
-			nodesInLevel = nodesInLevel / 2
-		} else {
-			nodesInLevel = 1 + (nodesInLevel / 2)
-		}
+		nodesInLevel = nextLevelNodeCount(nodesInLevel)
 
 		if lookInNodes {
 			lookInNodes = false
 		}
 
-		from, until = until, until+nodesInLevel
+		if loserIdx%2 == 0 {
+			leftIdx = loserIdx
+			rightIdx = loserIdx + 1
+		} else {
+			leftIdx = loserIdx - 1
+			rightIdx = loserIdx
+		}
+
+		from, until = until+1, until+nodesInLevel
+		auxNodeOffset = auxNodeOffset / 2
 	}
 }
 
