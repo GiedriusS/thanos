@@ -4,6 +4,8 @@
 package store
 
 import (
+	"fmt"
+
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
@@ -71,6 +73,7 @@ func nextLevelNodeCount(n int) int {
 	return n
 }
 
+// initialFix builds the whole tree at first.
 func (t *ProxyTournamentTree) initialFix() {
 	lastLoserIndex := -1
 
@@ -193,23 +196,22 @@ func (t *ProxyTournamentTree) Fix() {
 		panic("BUG: please call Fix() only after Pop()")
 	}
 
-	// Rebuild auxiliary nodes.
-
-	// Advance the original node & delete it if nothing left.
+	// Advance the original node & mark it if nothing left.
 	nextSeries := t.nodes[t.lastChangedNodeIndex].Next()
 	if !nextSeries {
 		t.nodes[t.lastChangedNodeIndex] = infinity
 	}
 
+	// Already start at the next level.
 	nodesInLevel := nextLevelNodeCount(len(t.nodes))
 
 	// Inclusive.
 	from, until := 0, nodesInLevel-1
 
+	// Offset from `from` to where the node shall be placed.
 	auxNodeOffset := t.lastChangedNodeIndex / 2
 
 	var leftIdx, rightIdx int
-
 	if t.lastChangedNodeIndex%2 == 0 {
 		leftIdx = t.lastChangedNodeIndex
 		rightIdx = t.lastChangedNodeIndex + 1
@@ -254,8 +256,16 @@ func (t *ProxyTournamentTree) Fix() {
 	for nodesInLevel > 0 {
 		loserIdx := from + auxNodeOffset
 
+		fmt.Println("Setting", loserIdx)
+
 		// Deduce the winner.
-		if rightIdx >= from || nilNode(rightIdx, lookInNodes) {
+		if rightIdx >= from && !lookInNodes {
+			t.auxiliaryNodes[loserIdx] = &treeAuxNode{
+				ss:                peekNode(leftIdx, true),
+				previousAuxIndex:  leftIdx,
+				previousNodeIndex: -1,
+			}
+		} else if !nilNode(leftIdx, lookInNodes) && nilNode(rightIdx, lookInNodes) {
 			if lookInNodes {
 				t.auxiliaryNodes[loserIdx] = &treeAuxNode{
 					ss:                peekNode(leftIdx, lookInNodes),
@@ -284,9 +294,20 @@ func (t *ProxyTournamentTree) Fix() {
 				}
 			}
 		} else if nilNode(rightIdx, lookInNodes) && nilNode(leftIdx, lookInNodes) {
-			t.auxiliaryNodes[loserIdx] = &treeAuxNode{
-				ss: infinity,
+			if lookInNodes {
+				t.auxiliaryNodes[loserIdx] = &treeAuxNode{
+					ss:                infinity,
+					previousAuxIndex:  -1,
+					previousNodeIndex: leftIdx,
+				}
+			} else {
+				t.auxiliaryNodes[loserIdx] = &treeAuxNode{
+					ss:                infinity,
+					previousAuxIndex:  leftIdx,
+					previousNodeIndex: -1,
+				}
 			}
+
 		} else {
 			left := peekNode(leftIdx, lookInNodes)
 			right := peekNode(rightIdx, lookInNodes)
@@ -327,9 +348,8 @@ func (t *ProxyTournamentTree) Fix() {
 
 		nodesInLevel = nextLevelNodeCount(nodesInLevel)
 
-		if lookInNodes {
-			lookInNodes = false
-		}
+		lookInNodes = false
+		from, until = until+1, until+nodesInLevel
 
 		if loserIdx%2 == 0 {
 			leftIdx = loserIdx
@@ -339,7 +359,6 @@ func (t *ProxyTournamentTree) Fix() {
 			rightIdx = loserIdx
 		}
 
-		from, until = until+1, until+nodesInLevel
 		auxNodeOffset = auxNodeOffset / 2
 	}
 }
@@ -357,11 +376,14 @@ func (t *ProxyTournamentTree) Pop() storepb.SeriesSet {
 				curNodeIdx = curNode.previousAuxIndex
 
 				curNode = t.auxiliaryNodes[curNode.previousAuxIndex]
+				fmt.Println("Resetting", oldNodeIdx)
 				t.auxiliaryNodes[oldNodeIdx] = nil
 				continue
 			}
 			if curNode.previousNodeIndex != -1 {
 				t.auxiliaryNodes[curNodeIdx] = nil
+				fmt.Println("Resetting", curNodeIdx)
+
 				t.lastChangedNodeIndex = curNode.previousNodeIndex
 				break
 			}

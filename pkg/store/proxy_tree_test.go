@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"sort"
 	"testing"
-	"time"
 
 	"github.com/leanovate/gopter"
 	"github.com/leanovate/gopter/gen"
@@ -58,7 +57,7 @@ func (s *mockSeries) Labels() labels.Labels {
 }
 
 func init() {
-	rand.Seed(time.Now().UnixNano())
+	rand.Seed(500)
 }
 
 var letterRunes = []rune("abcdefghijklmnopqrstuvwxyz")
@@ -73,16 +72,15 @@ func RandStringRunes(n int) string {
 
 func TestTournamentTreeCharacteristics(t *testing.T) {
 	parameters := gopter.DefaultTestParameters()
-	parameters.Rng.Seed(2000)
-	parameters.MinSuccessfulTests = 20000
+	parameters.Rng.Seed(300)
+	parameters.MinSuccessfulTests = 500
 	properties := gopter.NewProperties(parameters)
 
 	properties.Property("we can always pop at least the number of nodes", prop.ForAllNoShrink(
-		func(numberOfNodes, eachNodeLen int64) bool {
+		func(numberOfNodes, eachNodeLen int64) (bool, error) {
 			ss := []storepb.SeriesSet{}
 
 			for i := 0; i < int(numberOfNodes); i++ {
-
 				m := &mockSeriesSet{
 					series: []labels.Labels{},
 				}
@@ -100,20 +98,30 @@ func TestTournamentTreeCharacteristics(t *testing.T) {
 
 			tt := NewProxyTournamentTree(ss)
 
+			var prvsLbls labels.Labels
+
 			total := numberOfNodes * eachNodeLen
 
 			for total > 0 {
 				n := tt.Pop()
 				if n == nil {
-					return false
+					return false, fmt.Errorf("%d iterations done out of %d (got nil)", -(total - (numberOfNodes * eachNodeLen)), (numberOfNodes * eachNodeLen))
 				}
 
-				tt.Fix()
+				lbls, _ := n.At()
+				if prvsLbls != nil {
+					if labels.Compare(lbls, prvsLbls) > 0 {
+						return false, fmt.Errorf("got unsorted labels (%v and then %v)", prvsLbls, lbls)
+					}
+				}
+				prvsLbls = lbls
+
 				total--
+				tt.Fix()
 			}
 
-			return true
-		}, gen.Int64Range(1, 1000), gen.Int64Range(1, 1000),
+			return true, nil
+		}, gen.Int64Range(1, 50), gen.Int64Range(1, 150),
 	))
 
 	properties.TestingRun(t)
