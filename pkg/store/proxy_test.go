@@ -571,8 +571,9 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				MaxTime:                 300,
 				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
 				PartialResponseDisabled: true,
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
-			expectedErr: errors.New("test: receive series from test: test"),
+			expectedErr: errors.New("receive series from test: test"),
 		},
 		{
 			title: "partial response disabled; 1st store is slow, 2nd store is fast;",
@@ -606,8 +607,9 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				MaxTime:                 300,
 				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
 				PartialResponseDisabled: true,
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
-			expectedErr: errors.New("test: failed to receive any data in 4s from test: context deadline exceeded"),
+			expectedErr: errors.New("failed to receive any data in 4s from test: context deadline exceeded"),
 		},
 		{
 			title: "partial response disabled; 1st store is fast, 2nd store is slow;",
@@ -641,8 +643,9 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				MaxTime:                 300,
 				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
 				PartialResponseDisabled: true,
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
-			expectedErr: errors.New("test: failed to receive any data in 4s from test: context deadline exceeded"),
+			expectedErr: errors.New("failed to receive any data in 4s from test: context deadline exceeded"),
 		},
 		{
 			title: "partial response disabled; 1st store is slow on 2nd series, 2nd store is fast;",
@@ -679,8 +682,9 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				MaxTime:                 300,
 				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
 				PartialResponseDisabled: true,
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
-			expectedErr: errors.New("test: failed to receive any data in 4s from test: context deadline exceeded"),
+			expectedErr: errors.New("failed to receive any data in 4s from test: context deadline exceeded"),
 		},
 		{
 			title: "partial response disabled; 1st store is fast to respond, 2nd store is slow on 2nd series;",
@@ -717,8 +721,9 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				MaxTime:                 300,
 				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
 				PartialResponseDisabled: true,
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
-			expectedErr: errors.New("test: failed to receive any data in 4s from test: context deadline exceeded"),
+			expectedErr: errors.New("failed to receive any data in 4s from test: context deadline exceeded"),
 		},
 		{
 			title: "partial response enabled; 1st store is slow to respond, 2nd store is fast;",
@@ -936,6 +941,7 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 				MaxTime:                 300,
 				Matchers:                []storepb.LabelMatcher{{Name: "ext", Value: "1", Type: storepb.LabelMatcher_EQ}},
 				PartialResponseDisabled: true,
+				PartialResponseStrategy: storepb.PartialResponseStrategy_ABORT,
 			},
 			expectedSeries: []rawSeries{
 				{

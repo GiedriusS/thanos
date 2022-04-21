@@ -234,6 +234,21 @@ func (s cancelableRespSender) send(r *storepb.SeriesResponse) {
 	}
 }
 
+type recvResponse struct {
+	r   *storepb.SeriesResponse
+	err error
+}
+
+func frameCtx(responseTimeout time.Duration) (context.Context, context.CancelFunc) {
+	frameTimeoutCtx := context.Background()
+	var cancel context.CancelFunc
+	if responseTimeout != 0 {
+		frameTimeoutCtx, cancel = context.WithTimeout(frameTimeoutCtx, responseTimeout)
+		return frameTimeoutCtx, cancel
+	}
+	return frameTimeoutCtx, func() {}
+}
+
 func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesServer) error {
 	match, matchers, err := matchesExternalLabels(r.Matchers, s.selectorLabels)
 	if err != nil {
@@ -259,6 +274,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		SkipChunks:              r.SkipChunks,
 		QueryHints:              r.QueryHints,
 		PartialResponseDisabled: r.PartialResponseDisabled,
+		PartialResponseStrategy: r.PartialResponseStrategy,
 	}
 
 	stores := []Client{}
@@ -285,33 +301,81 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 			if err != nil {
 				return err
 			}
+
+			rCh := make(chan *recvResponse)
+			done := make(chan struct{})
+			go func() {
+				for {
+					r, err := cl.Recv()
+					select {
+					case <-done:
+						close(rCh)
+						return
+					case rCh <- &recvResponse{r: r, err: err}:
+					}
+				}
+			}()
+
+			// The `defer` only executed when function return, we do `defer cancel` in for loop,
+			// so make the loop body as a function, release timers created by context as early.
+			handleRecvResponse := func() (bool, error) {
+				frameTimeoutCtx, cancel := frameCtx(s.responseTimeout)
+				defer cancel()
+				var rr *recvResponse
+				select {
+				case <-gctx.Done():
+					// TODO: If some error then bubble it up as a warning/error depending on  partial response.
+					close(done)
+					return false, errors.Wrapf(gctx.Err(), "failed to receive any data from %s", st.Addr())
+				case <-frameTimeoutCtx.Done():
+					// TODO: If some error then bubble it up as a warning/error depending on  partial response.
+					close(done)
+					return false, errors.Wrapf(frameTimeoutCtx.Err(), "failed to receive any data in %v from %s", s.responseTimeout, st.String())
+				case rr = <-rCh:
+				}
+
+				if rr.err == io.EOF {
+					close(done)
+					return false, nil
+				}
+
+				if rr.err != nil {
+					return false, errors.Wrapf(rr.err, "receive series from %s", st.String())
+				}
+
+				responses[i].responses = append(responses[i].responses, rr.r)
+				return true, nil
+			}
+
 			for {
-				resp, err := cl.Recv()
-				if err == nil {
-					responses[i].responses = append(responses[i].responses, resp)
-					continue
-				}
-				if err == io.EOF {
-					return nil
-				}
+				ok, err := handleRecvResponse()
 				if err != nil {
 					return err
 				}
-				return nil
+				if !ok {
+					break
+				}
 			}
+			return nil
 		})
 	}
 
-	if err := g.Wait(); err != nil {
-		return err
+	gerr := g.Wait()
+	if (actualRequest.PartialResponseStrategy == storepb.PartialResponseStrategy_ABORT || actualRequest.PartialResponseDisabled) && gerr != nil {
+		return gerr
+	} else if gerr != nil && (actualRequest.PartialResponseStrategy == storepb.PartialResponseStrategy_WARN || !actualRequest.PartialResponseDisabled) {
+		if err := srv.Send(storepb.NewWarnSeriesResponse(gerr)); err != nil {
+			return err
+		}
 	}
 
-	seriesSets := []storepb.SeriesSet{}
+	seriesSets := []*respSet{}
 	for _, resp := range responses {
 		if len(resp.responses) == 0 {
+			s.metrics.emptyStreamResponses.Inc()
 			continue
 		}
-		seriesSets = append(seriesSets, &respSeriesSet{responses: resp.responses})
+		seriesSets = append(seriesSets, &respSet{responses: resp.responses})
 	}
 
 	if len(seriesSets) == 0 {
@@ -321,9 +385,13 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 	respHeap := NewProxyResponseHeap(seriesSets...)
 
 	for respHeap.Next() {
-		lbls, chks := respHeap.At()
+		resp := respHeap.At()
 
-		if err := srv.Send(storepb.NewSeriesResponse(&storepb.Series{Labels: labelpb.ZLabelsFromPromLabels(lbls), Chunks: chks})); err != nil {
+		if resp.GetWarning() != "" && (actualRequest.PartialResponseStrategy == storepb.PartialResponseStrategy_ABORT || actualRequest.PartialResponseDisabled) {
+			return errors.New(resp.GetWarning())
+		}
+
+		if err := srv.Send(resp); err != nil {
 			return err
 		}
 	}

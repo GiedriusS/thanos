@@ -8,6 +8,7 @@ import (
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
+	"github.com/thanos-io/thanos/pkg/store/labelpb"
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
@@ -18,10 +19,20 @@ import (
 type ProxyResponseHeap []ProxyResponseHeapNode
 
 func (h *ProxyResponseHeap) Less(i, j int) bool {
-	iLbls, _ := (*h)[i].ss.At()
-	jLbls, _ := (*h)[j].ss.At()
+	iResp := (*h)[i].rs.At()
+	jResp := (*h)[j].rs.At()
 
-	return labels.Compare(iLbls, jLbls) < 0
+	if iResp.GetSeries() != nil && jResp.GetSeries() != nil {
+		iLbls := labelpb.ZLabelsToPromLabels(iResp.GetSeries().Labels)
+		jLbls := labelpb.ZLabelsToPromLabels(jResp.GetSeries().Labels)
+		return labels.Compare(iLbls, jLbls) < 0
+	} else if iResp.GetSeries() == nil && jResp.GetSeries() != nil {
+		return true
+	} else if iResp.GetSeries() != nil && jResp.GetSeries() == nil {
+		return false
+	}
+	// If it is not a series then the order does not matter.
+	return false
 }
 
 func (h *ProxyResponseHeap) Len() int {
@@ -50,15 +61,15 @@ func (h *ProxyResponseHeap) Min() *ProxyResponseHeapNode {
 }
 
 type ProxyResponseHeapNode struct {
-	ss storepb.SeriesSet
+	rs *respSet
 }
 
-func NewProxyResponseHeap(seriesSets ...storepb.SeriesSet) storepb.SeriesSet {
+func NewProxyResponseHeap(seriesSets ...*respSet) *ProxyResponseHeap {
 	ret := make(ProxyResponseHeap, 0, len(seriesSets))
 
 	for _, ss := range seriesSets {
 		ss := ss
-		ret.Push(ProxyResponseHeapNode{ss: ss})
+		ret.Push(ProxyResponseHeapNode{rs: ss})
 	}
 
 	heap.Init(&ret)
@@ -70,10 +81,10 @@ func (h *ProxyResponseHeap) Next() bool {
 	return !h.Empty()
 }
 
-func (h *ProxyResponseHeap) At() (labels.Labels, []storepb.AggrChunk) {
-	min := h.Min().ss
+func (h *ProxyResponseHeap) At() *storepb.SeriesResponse {
+	min := h.Min().rs
 
-	atLbls, atChks := min.At()
+	atResp := min.At()
 
 	if min.Next() {
 		heap.Fix(h, 0)
@@ -81,33 +92,31 @@ func (h *ProxyResponseHeap) At() (labels.Labels, []storepb.AggrChunk) {
 		heap.Remove(h, 0)
 	}
 
-	return atLbls, atChks
+	return atResp
 }
 
 func (h *ProxyResponseHeap) Err() error {
 	return nil
 }
 
-type respSeriesSet struct {
+type respSet struct {
 	responses []*storepb.SeriesResponse
 	i         int
 }
 
-var _ = (storepb.SeriesSet)(&respSeriesSet{})
-
-func (ss *respSeriesSet) Next() bool {
+func (ss *respSet) Next() bool {
 	ss.i++
 	return ss.i < len(ss.responses)
 }
 
-func (ss *respSeriesSet) Err() error {
+func (ss *respSet) Err() error {
 	return nil
 }
 
-func (ss *respSeriesSet) Warnings() storage.Warnings {
+func (ss *respSet) Warnings() storage.Warnings {
 	return nil
 }
 
-func (ss *respSeriesSet) At() (labels.Labels, []storepb.AggrChunk) {
-	return ss.responses[ss.i].GetSeries().PromLabels(), ss.responses[ss.i].GetSeries().Chunks
+func (ss *respSet) At() *storepb.SeriesResponse {
+	return ss.responses[ss.i]
 }
