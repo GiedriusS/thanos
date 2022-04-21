@@ -949,7 +949,7 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 					chunks: [][]sample{{{1, 1}, {2, 2}, {3, 3}}},
 				},
 			},
-			expectedErr: errors.New("test: failed to receive any data from test: context deadline exceeded"),
+			expectedErr: errors.New("failed to receive any data from test: context deadline exceeded"),
 		},
 		{
 			title: "partial response enabled; all stores respond 3s",
@@ -1031,6 +1031,9 @@ func TestProxyStore_SeriesSlowStores(t *testing.T) {
 			return
 		}
 	}
+
+	// Sleep at the end so that the last goroutines would finish their work (stuck on time.Sleep()).
+	time.Sleep(10 * time.Second)
 }
 
 func TestProxyStore_Series_RequestParamsProxied(t *testing.T) {
