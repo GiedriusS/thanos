@@ -20,15 +20,21 @@ type dedupResponseHeap struct {
 
 	responses     []*storepb.SeriesResponse
 	savedResponse *storepb.SeriesResponse
+
+	previousNext bool
 }
 
 func NewDedupResponseHeap(h *ProxyResponseHeap) *dedupResponseHeap {
 	return &dedupResponseHeap{
-		h: h,
+		h:            h,
+		previousNext: h.Next(),
 	}
 }
 
 func (d *dedupResponseHeap) At() *storepb.SeriesResponse {
+	defer func() {
+		d.responses = d.responses[:0]
+	}()
 	if len(d.responses) == 0 {
 		return nil
 	} else if len(d.responses) == 1 {
@@ -60,58 +66,45 @@ func (d *dedupResponseHeap) At() *storepb.SeriesResponse {
 }
 
 func (d *dedupResponseHeap) Next() bool {
-	nextHeap := d.h.Next()
-
-	d.responses = d.responses[:0]
-
-	if !nextHeap {
-		if d.savedResponse != nil {
-			d.responses = append(d.responses, d.savedResponse)
-			d.savedResponse = nil
-			return true
-		}
-		return false
+	if !d.previousNext {
+		return len(d.responses) > 0
 	}
 
-	if d.savedResponse != nil {
-		d.responses = append(d.responses, d.savedResponse)
-		d.savedResponse = nil
+	resp := d.h.At()
+	nextHeap := d.h.Next()
+
+	defer func(next *bool) {
+		d.previousNext = *next
+	}(&nextHeap)
+
+	d.responses = d.responses[:0]
+	d.responses = append(d.responses, resp)
+
+	if resp.GetSeries() == nil {
+		return true
 	}
 
 	for {
-		// Collect as many series as possible.
-		resp := d.h.At()
-
+		nextHeap = d.h.Next()
+		if !nextHeap {
+			break
+		}
+		resp = d.h.At()
 		if resp.GetSeries() == nil {
-			if len(d.responses) == 0 {
-				d.responses = append(d.responses, resp)
-			} else {
-				d.savedResponse = resp
-			}
-
 			break
 		}
 
-		if len(d.responses) == 0 {
+		lbls := resp.GetSeries().Labels
+		lastLbls := d.responses[len(d.responses)-1].GetSeries().Labels
+
+		if labels.Compare(labelpb.ZLabelsToPromLabels(lbls), labelpb.ZLabelsToPromLabels(lastLbls)) == 0 {
 			d.responses = append(d.responses, resp)
 		} else {
-			lbls := resp.GetSeries().Labels
-			lastLbls := d.responses[len(d.responses)-1].GetSeries().Labels
-
-			if labels.Compare(labelpb.ZLabelsToPromLabels(lbls), labelpb.ZLabelsToPromLabels(lastLbls)) == 0 {
-				d.responses = append(d.responses, resp)
-			} else {
-				// This one is different.
-				d.savedResponse = resp
-				break
-			}
-		}
-
-		if !d.h.Next() {
+			// This one is different. It will be taken care of via the next Next() call.
 			break
 		}
-
 	}
+
 	return true
 }
 
