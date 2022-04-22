@@ -421,7 +421,8 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		return nil
 	}
 
-	respHeap := NewProxyResponseHeap(seriesSets...)
+	// Deduplicate chunks by labels.
+	respHeap := NewDedupResponseHeap(NewProxyResponseHeap(seriesSets...))
 
 	for respHeap.Next() {
 		resp := respHeap.At()

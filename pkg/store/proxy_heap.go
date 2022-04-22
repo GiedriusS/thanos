@@ -12,10 +12,115 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
+// dedupResponseHeap is a wrapper around ProxyResponseHeap
+// that deduplicates identical chunks identified by the same labelset.
+// It uses a hashing function to do that.
+type dedupResponseHeap struct {
+	h *ProxyResponseHeap
+
+	responses     []*storepb.SeriesResponse
+	savedResponse *storepb.SeriesResponse
+}
+
+func NewDedupResponseHeap(h *ProxyResponseHeap) *dedupResponseHeap {
+	return &dedupResponseHeap{
+		h: h,
+	}
+}
+
+func (d *dedupResponseHeap) At() *storepb.SeriesResponse {
+	if len(d.responses) == 0 {
+		return nil
+	} else if len(d.responses) == 1 {
+		return d.responses[0]
+	}
+	chunkDedupMap := map[string]*storepb.AggrChunk{}
+
+	for _, resp := range d.responses {
+		for _, chk := range resp.GetSeries().Chunks {
+			h := chk.Hash()
+
+			if _, ok := chunkDedupMap[h]; !ok {
+				chk := chk
+				chunkDedupMap[h] = &chk
+			}
+		}
+	}
+
+	finalChunks := make([]storepb.AggrChunk, len(chunkDedupMap))
+
+	for _, chk := range chunkDedupMap {
+		finalChunks = append(finalChunks, *chk)
+	}
+
+	return storepb.NewSeriesResponse(&storepb.Series{
+		Labels: d.responses[0].GetSeries().Labels,
+		Chunks: finalChunks,
+	})
+}
+
+func (d *dedupResponseHeap) Next() bool {
+	nextHeap := d.h.Next()
+
+	d.responses = d.responses[:0]
+
+	if !nextHeap {
+		if d.savedResponse != nil {
+			d.responses = append(d.responses, d.savedResponse)
+			d.savedResponse = nil
+			return true
+		}
+		return false
+	}
+
+	if d.savedResponse != nil {
+		d.responses = append(d.responses, d.savedResponse)
+		d.savedResponse = nil
+	}
+
+	for {
+		// Collect as many series as possible.
+		resp := d.h.At()
+
+		if resp.GetSeries() == nil {
+			if len(d.responses) == 0 {
+				d.responses = append(d.responses, resp)
+			} else {
+				d.savedResponse = resp
+			}
+
+			break
+		}
+
+		if len(d.responses) == 0 {
+			d.responses = append(d.responses, resp)
+		} else {
+			lbls := resp.GetSeries().Labels
+			lastLbls := d.responses[len(d.responses)-1].GetSeries().Labels
+
+			if labels.Compare(labelpb.ZLabelsToPromLabels(lbls), labelpb.ZLabelsToPromLabels(lastLbls)) == 0 {
+				d.responses = append(d.responses, resp)
+			} else {
+				// This one is different.
+				d.savedResponse = resp
+				break
+			}
+		}
+
+		if !d.h.Next() {
+			break
+		}
+
+	}
+	return true
+}
+
 // ProxyResponseHeap is a heap for storepb.SeriesSets.
 // It performs k-way merge between all of those sets.
 // TODO(GiedriusS): can be improved with a tournament tree.
-// This is O(n*logk) but can be Theta(n*logk).
+// This is O(n*logk) but can be Theta(n*logk). However,
+// tournament trees need n-1 auxiliary nodes so there
+// might not be much of a difference.
 type ProxyResponseHeap []ProxyResponseHeapNode
 
 func (h *ProxyResponseHeap) Less(i, j int) bool {
