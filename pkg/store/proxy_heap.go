@@ -18,10 +18,10 @@ import (
 type dedupResponseHeap struct {
 	h *ProxyResponseHeap
 
-	responses     []*storepb.SeriesResponse
-	savedResponse *storepb.SeriesResponse
+	responses []*storepb.SeriesResponse
 
-	previousNext bool
+	previousResponse *storepb.SeriesResponse
+	previousNext     bool
 }
 
 func NewDedupResponseHeap(h *ProxyResponseHeap) *dedupResponseHeap {
@@ -70,9 +70,15 @@ func (d *dedupResponseHeap) Next() bool {
 		return len(d.responses) > 0
 	}
 
-	resp := d.h.At()
-	nextHeap := d.h.Next()
+	var resp *storepb.SeriesResponse
+	if d.previousResponse != nil {
+		resp = d.previousResponse
+		d.previousResponse = nil
+	} else {
+		resp = d.h.At()
+	}
 
+	var nextHeap bool
 	defer func(next *bool) {
 		d.previousNext = *next
 	}(&nextHeap)
@@ -81,6 +87,7 @@ func (d *dedupResponseHeap) Next() bool {
 	d.responses = append(d.responses, resp)
 
 	if resp.GetSeries() == nil {
+		d.previousResponse = resp
 		return true
 	}
 
@@ -91,6 +98,7 @@ func (d *dedupResponseHeap) Next() bool {
 		}
 		resp = d.h.At()
 		if resp.GetSeries() == nil {
+			d.previousResponse = resp
 			break
 		}
 
@@ -101,6 +109,7 @@ func (d *dedupResponseHeap) Next() bool {
 			d.responses = append(d.responses, resp)
 		} else {
 			// This one is different. It will be taken care of via the next Next() call.
+			d.previousResponse = resp
 			break
 		}
 	}
