@@ -40,6 +40,7 @@ func (d *dedupResponseHeap) At() *storepb.SeriesResponse {
 	} else if len(d.responses) == 1 {
 		return d.responses[0]
 	}
+
 	chunkDedupMap := map[string]*storepb.AggrChunk{}
 
 	for _, resp := range d.responses {
@@ -48,19 +49,30 @@ func (d *dedupResponseHeap) At() *storepb.SeriesResponse {
 
 			if _, ok := chunkDedupMap[h]; !ok {
 				chk := chk
+
 				chunkDedupMap[h] = &chk
 			}
 		}
 	}
 
-	finalChunks := make([]storepb.AggrChunk, len(chunkDedupMap))
+	// If no chunks were requested.
+	if len(chunkDedupMap) == 0 {
+		return storepb.NewSeriesResponse(&storepb.Series{
+			Labels: d.responses[0].GetSeries().Labels,
+			Chunks: d.responses[0].GetSeries().Chunks,
+		})
+	}
+
+	finalChunks := make([]storepb.AggrChunk, 0, len(chunkDedupMap))
 
 	for _, chk := range chunkDedupMap {
 		finalChunks = append(finalChunks, *chk)
 	}
 
+	lbls := d.responses[0].GetSeries().Labels
+
 	return storepb.NewSeriesResponse(&storepb.Series{
-		Labels: d.responses[0].GetSeries().Labels,
+		Labels: lbls,
 		Chunks: finalChunks,
 	})
 }
