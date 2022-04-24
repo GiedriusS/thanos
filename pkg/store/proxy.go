@@ -309,10 +309,15 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		go func(i int, st Client) {
 			defer wg.Done()
 
+			storeID := labelpb.PromLabelSetsToString(st.LabelSets())
+			if storeID == "" {
+				storeID = "Store Gateway"
+			}
+
 			cl, err := st.Series(srv.Context(), actualRequest)
 			if err != nil {
 				errMtx.Lock()
-				errs.Add(err)
+				errs.Add(errors.Wrapf(err, "fetch series for %s %s", storeID, st))
 				errMtx.Unlock()
 				return
 			}

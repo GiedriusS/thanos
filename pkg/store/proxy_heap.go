@@ -5,6 +5,7 @@ package store
 
 import (
 	"container/heap"
+	"sort"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -69,6 +70,10 @@ func (d *dedupResponseHeap) At() *storepb.SeriesResponse {
 		finalChunks = append(finalChunks, *chk)
 	}
 
+	sort.Slice(finalChunks, func(i, j int) bool {
+		return finalChunks[i].Compare(finalChunks[j]) > 0
+	})
+
 	lbls := d.responses[0].GetSeries().Labels
 
 	return storepb.NewSeriesResponse(&storepb.Series{
@@ -78,29 +83,42 @@ func (d *dedupResponseHeap) At() *storepb.SeriesResponse {
 }
 
 func (d *dedupResponseHeap) Next() bool {
-	if !d.previousNext {
-		return len(d.responses) > 0
+	d.responses = d.responses[:0]
+
+	// If there is something buffered that is *not* a series.
+	if d.previousResponse != nil && d.previousResponse.GetSeries() == nil {
+		d.responses = append(d.responses, d.previousResponse)
+		d.previousResponse = nil
+		d.previousNext = d.h.Next()
+		return len(d.responses) > 0 || d.previousNext
 	}
 
 	var resp *storepb.SeriesResponse
+	var nextHeap bool
+
+	// If buffered then use it.
 	if d.previousResponse != nil {
 		resp = d.previousResponse
 		d.previousResponse = nil
 	} else {
+		// If not buffered then check whether there is anything.
+		nextHeap = d.h.Next()
+		if !nextHeap {
+			return false
+		}
 		resp = d.h.At()
 	}
 
-	var nextHeap bool
+	// Append buffered or retrieved response.
+	d.responses = append(d.responses, resp)
+
+	// Update previousNext.
 	defer func(next *bool) {
 		d.previousNext = *next
 	}(&nextHeap)
 
-	d.responses = d.responses[:0]
-	d.responses = append(d.responses, resp)
-
 	if resp.GetSeries() == nil {
-		d.previousResponse = resp
-		return true
+		return len(d.responses) > 0 || d.previousNext
 	}
 
 	for {
@@ -126,7 +144,7 @@ func (d *dedupResponseHeap) Next() bool {
 		}
 	}
 
-	return true
+	return len(d.responses) > 0 || d.previousNext
 }
 
 // ProxyResponseHeap is a heap for storepb.SeriesSets.
@@ -150,7 +168,9 @@ func (h *ProxyResponseHeap) Less(i, j int) bool {
 	} else if iResp.GetSeries() != nil && jResp.GetSeries() == nil {
 		return false
 	}
-	// If it is not a series then the order does not matter.
+
+	// If it is not a series then the order does not matter. What matters
+	// is that we get different types of responses one after another.
 	return false
 }
 
