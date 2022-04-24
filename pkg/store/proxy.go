@@ -314,11 +314,19 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 				storeID = "Store Gateway"
 			}
 
-			cl, err := st.Series(srv.Context(), actualRequest)
+			span, seriesCtx := tracing.StartSpan(srv.Context(), "proxy.series", tracing.Tags{
+				"store.id":   storeID,
+				"store.addr": st.Addr(),
+			})
+			cl, err := st.Series(seriesCtx, actualRequest)
 			if err != nil {
+				err = errors.Wrapf(err, "fetch series for %s %s", storeID, st)
 				errMtx.Lock()
-				errs.Add(errors.Wrapf(err, "fetch series for %s %s", storeID, st))
+				errs.Add(err)
 				errMtx.Unlock()
+
+				span.SetTag("err", err.Error())
+				span.Finish()
 				return
 			}
 
@@ -328,6 +336,8 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 				for {
 					// TODO: we can buffer this in files to have infinitely
 					// scalable read path.
+					// TODO: this sorely needs some limit on the number of series
+					// per each request.
 					r, err := cl.Recv()
 					select {
 					case <-done:
@@ -346,31 +356,44 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 				var rr *recvResponse
 				select {
 				case <-srv.Context().Done():
-					// TODO: If some error then bubble it up as a warning/error depending on  partial response.
-					close(done)
+					err := errors.Wrapf(srv.Context().Err(), "failed to receive any data from %s", st.String())
+
 					errMtx.Lock()
-					errs.Add(errors.Wrapf(srv.Context().Err(), "failed to receive any data from %s", st.String()))
+					errs.Add(err)
 					errMtx.Unlock()
+
+					span.SetTag("err", err.Error())
+					span.Finish()
+					close(done)
 					return false
 				case <-frameTimeoutCtx.Done():
-					// TODO: If some error then bubble it up as a warning/error depending on  partial response.
-					close(done)
+					err := errors.Wrapf(frameTimeoutCtx.Err(), "failed to receive any data in %v from %s", s.responseTimeout, st.String())
+
 					errMtx.Lock()
-					errs.Add(errors.Wrapf(frameTimeoutCtx.Err(), "failed to receive any data in %v from %s", s.responseTimeout, st.String()))
+					errs.Add(err)
 					errMtx.Unlock()
+
+					span.SetTag("err", err.Error())
+					span.Finish()
+					close(done)
 					return false
 				case rr = <-rCh:
 				}
 
 				if rr.err == io.EOF {
+					span.Finish()
 					close(done)
 					return false
 				}
 
 				if rr.err != nil {
+					err := errors.Wrapf(rr.err, "receive series from %s", st.String())
 					errMtx.Lock()
-					errs.Add(errors.Wrapf(rr.err, "receive series from %s", st.String()))
+					errs.Add(err)
 					errMtx.Unlock()
+
+					span.SetTag("err", err.Error())
+					span.Finish()
 					close(done)
 					return false
 				}
@@ -392,7 +415,7 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 	wg.Wait()
 
 	if (actualRequest.PartialResponseStrategy == storepb.PartialResponseStrategy_ABORT || actualRequest.PartialResponseDisabled) && errs.Err() != nil {
-		level.Error(reqLogger).Log("err", errs.Err())
+		level.Error(reqLogger).Log("err", errs.Err(), "msg", "partial response disabled; aborting request")
 
 		return errs.Err()
 	} else if errs.Err() != nil && (actualRequest.PartialResponseStrategy == storepb.PartialResponseStrategy_WARN || !actualRequest.PartialResponseDisabled) {
@@ -426,7 +449,6 @@ func (s *ProxyStore) Series(r *storepb.SeriesRequest, srv storepb.Store_SeriesSe
 		return nil
 	}
 
-	// Deduplicate chunks by labels.
 	respHeap := NewDedupResponseHeap(NewProxyResponseHeap(seriesSets...))
 
 	for respHeap.Next() {
