@@ -89,7 +89,7 @@ require (
 	go.uber.org/automaxprocs v1.5.1
 	go.uber.org/goleak v1.1.12
 	golang.org/x/crypto v0.0.0-20220622213112-05595931fe9d
-	golang.org/x/net v0.0.0-20220624214902-1bab6f366d9e
+	golang.org/x/net v0.0.0-20220630215102-69896b714898
 	golang.org/x/sync v0.0.0-20220601150217-0de741cfad7f
 	golang.org/x/text v0.3.7
 	golang.org/x/time v0.0.0-20220609170525-579cf78fd858
@@ -101,6 +101,8 @@ require (
 	gopkg.in/yaml.v2 v2.4.0
 	gopkg.in/yaml.v3 v3.0.1
 )
+
+require github.com/rueian/rueidis v0.0.65
 
 require (
 	cloud.google.com/go v0.102.0 // indirect
@@ -259,4 +261,4 @@ replace (
 	k8s.io/klog/v2 => github.com/simonpasquier/klog-gokit/v3 v3.0.0
 )
 
-go 1.17
+go 1.18

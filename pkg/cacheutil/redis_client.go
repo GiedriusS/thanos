@@ -6,20 +6,21 @@ package cacheutil
 import (
 	"context"
 	"fmt"
-	"sync"
+	"net"
 	"time"
 	"unsafe"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/go-redis/redis/v8"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/rueian/rueidis"
 	"gopkg.in/yaml.v3"
 
 	"github.com/thanos-io/thanos/pkg/extprom"
 	"github.com/thanos-io/thanos/pkg/gate"
+	"github.com/thanos-io/thanos/pkg/model"
 )
 
 var (
@@ -40,8 +41,12 @@ var (
 
 // RedisClientConfig is the config accepted by RedisClient.
 type RedisClientConfig struct {
-	// Addr specifies the addresses of redis server.
+	// DEPRECATED: addr specifies the addresses of redis server. Use `addrs`.
 	Addr string `yaml:"addr"`
+
+	// Addrs specifies the addresses of Redis. If there are multiple addresses,
+	// then we assume that we are talking to a Redis Cluster.
+	Addrs []string `yaml:"addrs"`
 
 	// Use the specified Username to authenticate the current connection
 	// with one of the connections defined in the ACL list when connecting
@@ -94,18 +99,22 @@ type RedisClientConfig struct {
 
 	// SetMultiBatchSize specifies the maximum size per batch for pipeline set.
 	SetMultiBatchSize int `yaml:"set_multi_batch_size"`
+
+	// Size of the per-connection cache. If not zero then client-side
+	// caching is enabled.
+	CacheSize model.Bytes `yaml:"cache_size"`
 }
 
 func (c *RedisClientConfig) validate() error {
-	if c.Addr == "" {
-		return errors.New("no redis addr provided")
+	if c.Addr == "" && len(c.Addrs) == 0 {
+		return errors.New("no redis addr or addrs provided")
 	}
 	return nil
 }
 
 // RedisClient is a wrap of redis.Client.
 type RedisClient struct {
-	*redis.Client
+	client rueidis.Client
 	config RedisClientConfig
 
 	// getMultiGate used to enforce the max number of concurrent GetMulti() operations.
@@ -136,25 +145,40 @@ func NewRedisClientWithConfig(logger log.Logger, name string, config RedisClient
 	if err := config.validate(); err != nil {
 		return nil, err
 	}
-	redisClient := redis.NewClient(&redis.Options{
-		Addr:         config.Addr,
-		Username:     config.Username,
-		Password:     config.Password,
-		DB:           config.DB,
-		DialTimeout:  config.DialTimeout,
-		ReadTimeout:  config.ReadTimeout,
-		WriteTimeout: config.WriteTimeout,
-		MinIdleConns: config.MinIdleConns,
-		MaxConnAge:   config.MaxConnAge,
-		IdleTimeout:  config.IdleTimeout,
-	})
 
+	var addrs []string
+
+	if len(config.Addrs) > 0 {
+		addrs = config.Addrs
+	} else {
+		addrs = []string{config.Addr}
+	}
+
+	var cacheSize int
+	if config.CacheSize > 0 {
+		cacheSize = int(config.CacheSize)
+	}
+
+	rueidisClient, err := rueidis.NewClient(rueidis.ClientOption{
+		InitAddress:       addrs,
+		ShuffleInit:       true,
+		Username:          config.Username,
+		Password:          config.Password,
+		SelectDB:          config.DB,
+		CacheSizeEachConn: cacheSize,
+		Dialer:            net.Dialer{Timeout: config.DialTimeout},
+		ConnWriteTimeout:  config.WriteTimeout,
+		BlockingPoolSize:  config.PoolSize,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("creating new rueidis client: %w", err)
+	}
 	if reg != nil {
 		reg = prometheus.WrapRegistererWith(prometheus.Labels{"name": name}, reg)
 	}
 
 	c := &RedisClient{
-		Client: redisClient,
+		client: rueidisClient,
 		config: config,
 		logger: logger,
 		getMultiGate: gate.New(
@@ -180,9 +204,8 @@ func NewRedisClientWithConfig(logger log.Logger, name string, config RedisClient
 // SetAsync implement RemoteCacheClient.
 func (c *RedisClient) SetAsync(ctx context.Context, key string, value []byte, ttl time.Duration) error {
 	start := time.Now()
-	if _, err := c.Set(ctx, key, value, ttl).Result(); err != nil {
-		level.Warn(c.logger).Log("msg", "failed to set item into redis", "err", err, "key", key,
-			"value_size", len(value))
+	if err := c.client.Do(ctx, c.client.B().Set().Key(key).Value(rueidis.BinaryString(value)).ExSeconds(int64(ttl.Seconds())).Build()).Error(); err != nil {
+		level.Warn(c.logger).Log("msg", "failed to set item into redis", "err", err, "key", key, "value_size", len(value))
 		return nil
 	}
 	c.durationSet.Observe(time.Since(start).Seconds())
@@ -195,28 +218,16 @@ func (c *RedisClient) SetMulti(ctx context.Context, data map[string][]byte, ttl 
 		return
 	}
 	start := time.Now()
-	keys := make([]string, 0, len(data))
-	for k := range data {
-		keys = append(keys, k)
+	sets := make(rueidis.Commands, 0, len(data))
+	ittl := int64(ttl.Seconds())
+	for k, v := range data {
+		sets = append(sets, c.client.B().Setex().Key(k).Seconds(ittl).Value(rueidis.BinaryString(v)).Build())
 	}
-	err := doWithBatch(ctx, len(data), c.config.SetMultiBatchSize, c.setMultiGate, func(startIndex, endIndex int) error {
-		_, err := c.Pipelined(ctx, func(p redis.Pipeliner) error {
-			for _, key := range keys {
-				p.SetEX(ctx, key, data[key], ttl)
-			}
-			return nil
-		})
-		if err != nil {
-			level.Warn(c.logger).Log("msg", "failed to set multi items from redis",
-				"err", err, "items", len(data))
-			return nil
+	for _, resp := range c.client.DoMulti(ctx, sets...) {
+		if err := resp.Error(); err != nil {
+			level.Warn(c.logger).Log("msg", "failed to set multi items from redis", "err", err, "items", len(data))
+			return
 		}
-		return nil
-	})
-	if err != nil {
-		level.Warn(c.logger).Log("msg", "failed to set multi items from redis", "err", err,
-			"items", len(data))
-		return
 	}
 	c.durationSetMulti.Observe(time.Since(start).Seconds())
 }
@@ -228,32 +239,21 @@ func (c *RedisClient) GetMulti(ctx context.Context, keys []string) map[string][]
 	}
 	start := time.Now()
 	results := make(map[string][]byte, len(keys))
-	var mu sync.Mutex
-	err := doWithBatch(ctx, len(keys), c.config.GetMultiBatchSize, c.getMultiGate, func(startIndex, endIndex int) error {
-		currentKeys := keys[startIndex:endIndex]
-		resp, err := c.MGet(ctx, currentKeys...).Result()
-		if err != nil {
-			level.Warn(c.logger).Log("msg", "failed to mget items from redis", "err", err, "items", len(resp))
-			return nil
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		for i := 0; i < len(resp); i++ {
-			key := currentKeys[i]
-			switch val := resp[i].(type) {
-			case string:
-				results[key] = stringToBytes(val)
-			case nil: // miss
-			default:
-				level.Warn(c.logger).Log("msg",
-					fmt.Sprintf("unexpected redis mget result type:%T %v", resp[i], resp[i]))
-			}
-		}
-		return nil
-	})
+
+	if c.config.ReadTimeout > 0 {
+		timeoutCtx, cancel := context.WithTimeout(ctx, c.config.ReadTimeout)
+		defer cancel()
+		ctx = timeoutCtx
+	}
+
+	resps, err := rueidis.MGetCache(c.client, ctx, 1*time.Hour, keys)
 	if err != nil {
-		level.Warn(c.logger).Log("msg", "failed to mget items from redis", "err", err, "items", len(keys))
-		return nil
+		level.Warn(c.logger).Log("msg", "failed to mget items from redis", "err", err, "items", len(resps))
+	}
+	for key, resp := range resps {
+		if val, err := resp.ToString(); err == nil {
+			results[key] = stringToBytes(val)
+		}
 	}
 	c.durationGetMulti.Observe(time.Since(start).Seconds())
 	return results
@@ -261,9 +261,16 @@ func (c *RedisClient) GetMulti(ctx context.Context, keys []string) map[string][]
 
 // Stop implement RemoteCacheClient.
 func (c *RedisClient) Stop() {
-	if err := c.Close(); err != nil {
-		level.Error(c.logger).Log("msg", "redis close err")
+	c.client.Close()
+}
+
+// parseRedisClientConfig unmarshals a buffer into a RedisClientConfig with default values.
+func parseRedisClientConfig(conf []byte) (RedisClientConfig, error) {
+	config := DefaultRedisClientConfig
+	if err := yaml.Unmarshal(conf, &config); err != nil {
+		return RedisClientConfig{}, err
 	}
+	return config, nil
 }
 
 // stringToBytes converts string to byte slice (copied from vendor/github.com/go-redis/redis/v8/internal/util/unsafe.go).
@@ -274,13 +281,4 @@ func stringToBytes(s string) []byte {
 			Cap int
 		}{s, len(s)},
 	))
-}
-
-// parseRedisClientConfig unmarshals a buffer into a RedisClientConfig with default values.
-func parseRedisClientConfig(conf []byte) (RedisClientConfig, error) {
-	config := DefaultRedisClientConfig
-	if err := yaml.Unmarshal(conf, &config); err != nil {
-		return RedisClientConfig{}, err
-	}
-	return config, nil
 }
