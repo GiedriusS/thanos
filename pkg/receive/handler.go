@@ -1469,7 +1469,14 @@ func (p *peerGroup) getConnection(ctx context.Context, endpoint Endpoint) (Write
 
 	var client peerClient
 	if p.useCapNProtoReplication {
-		client = writecapnp.NewRemoteWriteClient(writecapnp.NewTCPDialer(endpoint.CapNProtoAddress), p.logger)
+		conn, err := writecapnp.NewTCPDialer(endpoint.CapNProtoAddress)
+
+		if err != nil {
+			p.markPeerUnavailableUnlocked(endpoint)
+			dialError := errors.Wrap(err, "failed to dial peer")
+			return nil, errors.Wrap(dialError, errUnavailable.Error())
+		}
+		client = writecapnp.NewRemoteWriteClient(conn, p.logger)
 	} else {
 		conn, err := p.dialer(endpoint.Address, p.dialOpts...)
 		if err != nil {

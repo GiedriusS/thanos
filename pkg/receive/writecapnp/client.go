@@ -5,6 +5,7 @@ package writecapnp
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sync"
 
@@ -20,28 +21,148 @@ import (
 	"github.com/thanos-io/thanos/pkg/store/storepb"
 )
 
+// TCPPool common connection pool. Code is inspired by https://github.com/go-baa/pool.
+type TCPPool struct {
+	// New creates a new connection.
+	New func() (any, error)
+	// Ping checks that the connection is ok.
+	Ping func(any) bool
+	// Close closes the connection.
+	Close func(any) error
+	store chan any
+	mu    sync.Mutex
+}
+
+var (
+	// ErrClosed is the error resulting if the pool is closed via pool.Close().
+	ErrClosed = errors.New("pool is closed")
+)
+
+// NewTCPPool create a pool with capacity
+func NewTCPPool(initCap, maxCap int, newFunc func() (any, error)) (*TCPPool, error) {
+	if maxCap == 0 || initCap > maxCap {
+		return nil, fmt.Errorf("invalid capacity settings")
+	}
+	p := new(TCPPool)
+	p.store = make(chan interface{}, maxCap)
+	if newFunc != nil {
+		p.New = newFunc
+	}
+	for i := 0; i < initCap; i++ {
+		v, err := p.create()
+		if err != nil {
+			return p, err
+		}
+		p.store <- v
+	}
+	return p, nil
+}
+
+// Len returns current connections in pool
+func (p *TCPPool) Len() int {
+	return len(p.store)
+}
+
+// Get returns a conn form store or create one
+func (p *TCPPool) Get() (interface{}, error) {
+	if p.store == nil {
+		return nil, ErrClosed
+	}
+	for {
+		select {
+		case v := <-p.store:
+			if p.Ping != nil && !p.Ping(v) {
+				continue
+			}
+			return v, nil
+		default:
+			return p.create()
+		}
+	}
+}
+
+// Put set back conn into store again.
+func (p *TCPPool) Put(v interface{}) {
+	select {
+	case p.store <- v:
+		return
+	default:
+		// pool is full, close passed connection
+		if p.Close != nil {
+			p.Close(v)
+		}
+		return
+	}
+}
+
+// Destroy clear all connections
+func (p *TCPPool) Destroy() error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.store == nil {
+		return nil
+	}
+	var errs []error
+	close(p.store)
+	for v := range p.store {
+		if p.Close != nil {
+			if err := p.Close(v); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	p.store = nil
+
+	if len(errs) > 0 {
+		return errors.Errorf("close errors: %v", errs)
+	}
+	return nil
+}
+
+func (p *TCPPool) create() (any, error) {
+	if p.New == nil {
+		return nil, fmt.Errorf("Pool.New is nil, can not create connection")
+	}
+	return p.New()
+}
+
 type Dialer interface {
 	Dial() (net.Conn, error)
 }
 
 type TCPDialer struct {
-	address string
+	connPool *TCPPool
 }
 
-func NewTCPDialer(address string) *TCPDialer {
-	return &TCPDialer{address: address}
-}
+func NewTCPDialer(address string) (*TCPDialer, error) {
+	tcpPool, err := NewTCPPool(
+		1, 128, func() (any, error) {
+			addr, err := net.ResolveTCPAddr("tcp", address)
+			if err != nil {
+				return nil, err
+			}
+			conn, err := net.DialTCP("tcp", nil, addr)
+			if err != nil {
+				return nil, errors.Wrapf(err, "failed to dial peer %s", address)
+			}
 
-func (t TCPDialer) Dial() (net.Conn, error) {
-	addr, err := net.ResolveTCPAddr("tcp", t.address)
+			return conn, nil
+		})
 	if err != nil {
 		return nil, err
 	}
-	conn, err := net.DialTCP("tcp", nil, addr)
-	if err != nil {
-		return nil, errors.Wrapf(err, "failed to dial peer %s", t.address)
+	tcpPool.Close = func(any interface{}) error {
+		return any.(*net.TCPConn).Close()
 	}
-	return conn, nil
+	return &TCPDialer{connPool: tcpPool}, nil
+}
+
+func (t TCPDialer) Dial() (net.Conn, error) {
+	conn, err := t.connPool.New()
+	if err != nil {
+		return nil, err
+	}
+	return conn.(*net.TCPConn), nil
 }
 
 type RemoteWriteClient struct {
@@ -66,9 +187,12 @@ func (r *RemoteWriteClient) RemoteWrite(ctx context.Context, in *storepb.WriteRe
 }
 
 func (r *RemoteWriteClient) writeWithReconnect(ctx context.Context, numReconnects int, in *storepb.WriteRequest) (*storepb.WriteResponse, error) {
-	if err := r.connect(ctx); err != nil {
+	conn, err := r.connect(ctx)
+	if err != nil {
 		return nil, err
 	}
+	defer r.put(conn)
+
 	arena := capnp.SingleSegment(nil)
 	defer arena.Release()
 
@@ -96,11 +220,7 @@ func (r *RemoteWriteClient) writeWithReconnect(ctx context.Context, numReconnect
 	if err != nil {
 		if numReconnects > 0 && capnp.IsDisconnected(err) {
 			level.Warn(r.logger).Log("msg", "rpc failed, reconnecting")
-			if err := r.Close(); err != nil {
-				return nil, err
-			}
-			numReconnects--
-			return r.writeWithReconnect(ctx, numReconnects, in)
+			return r.writeWithReconnect(ctx, numReconnects-1, in)
 		}
 		return nil, errors.Wrap(err, "failed writing to peer")
 	}
@@ -118,29 +238,34 @@ func (r *RemoteWriteClient) writeWithReconnect(ctx context.Context, numReconnect
 	}
 }
 
-func (r *RemoteWriteClient) connect(ctx context.Context) error {
+func (r *RemoteWriteClient) connect(ctx context.Context) (net.Conn, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.conn != nil {
-		return nil
+		return nil, nil
 	}
 
 	conn, err := r.dialer.Dial()
 	if err != nil {
-		return errors.Wrap(err, "failed to dial peer")
+		return nil, errors.Wrap(err, "failed to dial peer")
 	}
 	r.conn = rpc.NewConn(rpc.NewPackedStreamTransport(conn), nil)
 	r.writer = Writer(r.conn.Bootstrap(ctx))
-	return nil
+	return conn, nil
+}
+
+func (r *RemoteWriteClient) put(c net.Conn) {
+	d, ok := r.dialer.(*TCPDialer)
+	if !ok {
+		return
+	}
+	d.connPool.Put(c)
 }
 
 func (r *RemoteWriteClient) Close() error {
-	r.mu.Lock()
-	if r.conn != nil {
-		conn := r.conn
-		r.conn = nil
-		go conn.Close()
+	d, ok := r.dialer.(*TCPDialer)
+	if !ok {
+		return nil
 	}
-	r.mu.Unlock()
-	return nil
+	return d.connPool.Destroy()
 }

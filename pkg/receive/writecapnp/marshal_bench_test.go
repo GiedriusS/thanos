@@ -113,15 +113,7 @@ func BenchmarkMarshalWriteRequest(b *testing.B) {
 			require.NoError(b, err)
 		}
 	})
-	b.Run("decoder", func(b *testing.B) {
-		for i := 0; i < b.N; i++ {
-			msg, err := capnp.NewDecoder(bytes.NewReader(bs)).Decode()
-			require.NoError(b, err)
 
-			_, err = ReadRootWriteRequest(msg)
-			require.NoError(b, err)
-		}
-	})
 	b.Run("decoder_packed", func(b *testing.B) {
 		b.ReportAllocs()
 		for i := 0; i < b.N; i++ {
