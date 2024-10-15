@@ -136,7 +136,8 @@ type TCPDialer struct {
 
 func NewTCPDialer(address string) (*TCPDialer, error) {
 	tcpPool, err := NewTCPPool(
-		1, 128, func() (any, error) {
+		1, 64, func() (any, error) {
+			fmt.Println("creating a new conn")
 			addr, err := net.ResolveTCPAddr("tcp", address)
 			if err != nil {
 				return nil, err
@@ -152,6 +153,9 @@ func NewTCPDialer(address string) (*TCPDialer, error) {
 		return nil, err
 	}
 	tcpPool.Close = func(any interface{}) error {
+		if any == nil {
+			return nil
+		}
 		return any.(*net.TCPConn).Close()
 	}
 	return &TCPDialer{connPool: tcpPool}, nil
@@ -191,7 +195,6 @@ func (r *RemoteWriteClient) writeWithReconnect(ctx context.Context, numReconnect
 	if err != nil {
 		return nil, err
 	}
-	defer r.put(conn)
 
 	arena := capnp.SingleSegment(nil)
 	defer arena.Release()
@@ -218,12 +221,20 @@ func (r *RemoteWriteClient) writeWithReconnect(ctx context.Context, numReconnect
 
 	s, err := result.Struct()
 	if err != nil {
-		if numReconnects > 0 && capnp.IsDisconnected(err) {
+		if capnp.IsDisconnected(err) {
+			conn.Close()
+			r.mu.Lock()
+			r.conn = nil
+			r.mu.Unlock()
+		}
+		if numReconnects > 0 {
 			level.Warn(r.logger).Log("msg", "rpc failed, reconnecting")
 			return r.writeWithReconnect(ctx, numReconnects-1, in)
 		}
 		return nil, errors.Wrap(err, "failed writing to peer")
 	}
+	defer r.put(conn)
+
 	switch s.Error() {
 	case WriteError_unavailable:
 		return nil, status.Error(codes.Unavailable, "rpc failed")
@@ -255,6 +266,9 @@ func (r *RemoteWriteClient) connect(ctx context.Context) (net.Conn, error) {
 }
 
 func (r *RemoteWriteClient) put(c net.Conn) {
+	if r.dialer == nil {
+		return
+	}
 	d, ok := r.dialer.(*TCPDialer)
 	if !ok {
 		return
@@ -263,6 +277,9 @@ func (r *RemoteWriteClient) put(c net.Conn) {
 }
 
 func (r *RemoteWriteClient) Close() error {
+	if r.dialer == nil {
+		return nil
+	}
 	d, ok := r.dialer.(*TCPDialer)
 	if !ok {
 		return nil

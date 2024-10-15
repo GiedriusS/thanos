@@ -4,12 +4,17 @@
 package e2e_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+
+	e2einteractive "github.com/efficientgo/e2e/interactive"
+	"github.com/pkg/errors"
+
 	"os"
 	"testing"
 	"time"
@@ -21,6 +26,7 @@ import (
 	"github.com/efficientgo/e2e/monitoring/matchers"
 	logkit "github.com/go-kit/log"
 	"github.com/golang/snappy"
+
 	"github.com/prometheus/common/model"
 	"google.golang.org/protobuf/proto"
 
@@ -1192,4 +1198,205 @@ func TestReceiveCpnp(t *testing.T) {
 	}))
 
 	testutil.Ok(t, i.WaitSumMetricsWithOptions(e2emon.Equals(0), []string{"prometheus_tsdb_blocks_loaded"}, e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "tenant", "default-tenant")), e2emon.WaitMissingMetrics()))
+}
+
+func TestReceiveCpnpBench(t *testing.T) {
+	e, err := e2e.NewDockerEnvironment("receive-bcpnp")
+	testutil.Ok(t, err)
+	t.Cleanup(e2ethanos.CleanScenario(t, e))
+
+	// Cap n' proto part.
+	iCpnp := e2ethanos.NewReceiveBuilder(e, "icpnp").WithIngestionEnabled().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(iCpnp))
+
+	hCpnp := receive.HashringConfig{
+		TenantMatcherType: "glob",
+		Tenants: []string{
+			"default*",
+		},
+		Endpoints: []receive.Endpoint{
+			{Address: iCpnp.InternalEndpoint("grpc"), CapNProtoAddress: iCpnp.InternalEndpoint("capnp")},
+		},
+	}
+
+	bigLabels := []*labelpb.Label{
+		{Name: "aa", Value: "bb"},
+		{Name: "bb", Value: "cc"},
+		{Name: "cc", Value: "dd"},
+		{Name: "dd", Value: "ee"},
+		{Name: "ee", Value: "ff"},
+		{Name: "ff", Value: "gg"},
+		{Name: "gg", Value: "hh"},
+		{Name: "hh", Value: "ii"},
+		{Name: "ii", Value: "jj"},
+		{Name: "jj", Value: "kk"},
+		{Name: "kk", Value: "ll"},
+		{Name: "ll", Value: "mm"},
+		{Name: "mm", Value: "nn"},
+		{Name: "nn", Value: "oo"},
+		{Name: "oo", Value: "pp"},
+		{Name: "pp", Value: "qq"},
+		{Name: "qq", Value: "rr"},
+		{Name: "rr", Value: "ss"},
+		{Name: "ss", Value: "tt"},
+		{Name: "tt", Value: "uu"},
+		{Name: "uu", Value: "vv"},
+		{Name: "vv", Value: "ww"},
+		{Name: "ww", Value: "xx"},
+		{Name: "xx", Value: "yy"},
+		{Name: "yy", Value: "zz"},
+		{Name: "zz", Value: "aa"},
+	}
+
+	rCpnp := e2ethanos.NewReceiveBuilder(e, "rcpnp").WithRouting(1, hCpnp).UseCapnpReplication().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(rCpnp))
+
+	require.NoError(t, runutil.RetryWithLog(logkit.NewLogfmtLogger(os.Stdout), 1*time.Second, make(<-chan struct{}), func() error {
+		return storeWriteRequest(context.Background(), "http://"+rCpnp.Endpoint("remote-write")+"/api/v1/receive", &prompb.WriteRequest{
+			Timeseries: []*prompb.TimeSeries{
+				{
+					Labels: bigLabels,
+					Samples: []*prompb.Sample{
+						{Value: 1, Timestamp: time.Now().UnixMilli()},
+					},
+				},
+			},
+		})
+	}))
+
+	testutil.Ok(t, iCpnp.WaitSumMetricsWithOptions(e2emon.Equals(0), []string{"prometheus_tsdb_blocks_loaded"}, e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "tenant", "default-tenant")), e2emon.WaitMissingMetrics()))
+
+	go func() {
+		for {
+			runutil.RetryWithLog(logkit.NewLogfmtLogger(os.Stdout), 1*time.Millisecond, make(<-chan struct{}), func() error {
+				req := &prompb.WriteRequest{
+					Timeseries: []*prompb.TimeSeries{
+						{
+							Labels: bigLabels,
+							Samples: []*prompb.Sample{
+								{Value: 1, Timestamp: time.Now().UnixMilli()},
+							},
+						},
+					},
+				}
+				pBuf, err := proto.Marshal(req)
+				if err != nil {
+					return err
+				}
+
+				compressed := snappy.Encode(pBuf, pBuf)
+
+				resp, err := http.Post("http://"+rCpnp.Endpoint("remote-write")+"/api/v1/receive", "application/x-protobuf", bytes.NewReader(compressed))
+				if err != nil {
+					return err
+				}
+				defer runutil.ExhaustCloseWithLogOnErr(logkit.NewLogfmtLogger(os.Stdout), resp.Body, "close body")
+
+				if resp.StatusCode/100 != 2 {
+					return errors.Errorf("unexpected status code cpnp %d", resp.StatusCode)
+				}
+
+				return nil
+			})
+		}
+	}()
+
+	// Protobuf part.
+	i := e2ethanos.NewReceiveBuilder(e, "iproto").WithIngestionEnabled().Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(i))
+
+	h := receive.HashringConfig{
+		TenantMatcherType: "glob",
+		Tenants: []string{
+			"default*",
+		},
+		Endpoints: []receive.Endpoint{
+			{Address: i.InternalEndpoint("grpc"), CapNProtoAddress: i.InternalEndpoint("capnp")},
+		},
+	}
+
+	r := e2ethanos.NewReceiveBuilder(e, "rproto").WithRouting(1, h).Init()
+	testutil.Ok(t, e2e.StartAndWaitReady(r))
+
+	require.NoError(t, runutil.RetryWithLog(logkit.NewLogfmtLogger(os.Stdout), 1*time.Second, make(<-chan struct{}), func() error {
+		return storeWriteRequest(context.Background(), "http://"+r.Endpoint("remote-write")+"/api/v1/receive", &prompb.WriteRequest{
+			Timeseries: []*prompb.TimeSeries{
+				{
+					Labels: bigLabels,
+					Samples: []*prompb.Sample{
+						{Value: 1, Timestamp: time.Now().UnixMilli()},
+					},
+				},
+			},
+		})
+	}))
+
+	testutil.Ok(t, i.WaitSumMetricsWithOptions(e2emon.Equals(0), []string{"prometheus_tsdb_blocks_loaded"}, e2emon.WithLabelMatchers(matchers.MustNewMatcher(matchers.MatchEqual, "tenant", "default-tenant")), e2emon.WaitMissingMetrics()))
+
+	go func() {
+		for {
+			runutil.RetryWithLog(logkit.NewLogfmtLogger(os.Stdout), 1*time.Millisecond, make(<-chan struct{}), func() error {
+				req := &prompb.WriteRequest{
+					Timeseries: []*prompb.TimeSeries{
+						{
+							Labels: bigLabels,
+							Samples: []*prompb.Sample{
+								{Value: 1, Timestamp: time.Now().UnixMilli()},
+							},
+						},
+					},
+				}
+				pBuf, err := proto.Marshal(req)
+				if err != nil {
+					return err
+				}
+
+				compressed := snappy.Encode(pBuf, pBuf)
+
+				resp, err := http.Post("http://"+r.Endpoint("remote-write")+"/api/v1/receive", "application/x-protobuf", bytes.NewReader(compressed))
+				if err != nil {
+					return err
+				}
+				defer runutil.ExhaustCloseWithLogOnErr(logkit.NewLogfmtLogger(os.Stdout), resp.Body, "close body")
+
+				if resp.StatusCode/100 != 2 {
+					return errors.Errorf("unexpected status code %d", resp.StatusCode)
+				}
+
+				return nil
+			})
+		}
+	}()
+
+	// Prometheus part.
+
+	config := fmt.Sprintf(`
+global:
+  external_labels:
+    prometheus: foo
+scrape_configs:
+- job_name: 'cpnp'
+  scrape_interval: 5s
+  scrape_timeout: 5s
+  static_configs:
+  - targets: [%s, %s]
+- job_name: 'proto'
+  scrape_interval: 5s
+  scrape_timeout: 5s
+  static_configs:
+  - targets: [%s, %s]
+  relabel_configs:
+  - source_labels: ['__address__']
+    regex: '^.+:80$'
+    action: drop
+`, rCpnp.InternalEndpoint("http"), iCpnp.InternalEndpoint("http"), r.InternalEndpoint("http"), i.InternalEndpoint("http"))
+	prom := e2edb.NewPrometheus(e, "prom")
+	require.NoError(t, prom.SetConfigEncoded([]byte(config)))
+	testutil.Ok(t, e2e.StartAndWaitReady(prom))
+
+	const path = "graph?g0.expr=sum(avg_over_time(go_memstats_alloc_bytes[5m]))%20by%20(job)&g0.tab=0&g0.stacked=0&g0.range_input=30m&g0.max_source_resolution=0s&g0.deduplicate=0&g0.partial_response=0&g0.store_matches=%5B%5D"
+	testutil.Ok(t, e2einteractive.OpenInBrowser(fmt.Sprintf("http://%s/%s", prom.Endpoint("http"), path)))
+
+	time.Sleep(9999 * time.Second)
+
 }
