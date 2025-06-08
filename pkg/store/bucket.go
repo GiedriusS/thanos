@@ -1726,11 +1726,6 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 						nil,
 					)
 				} else {
-					lazyRetrievalMaxBufferedResponses := s.lazyRetrievalMaxBufferedResponses
-					if lazyRetrievalMaxBufferedResponses < 1 {
-						// Some unit and e2e tests hit this path.
-						lazyRetrievalMaxBufferedResponses = 1
-					}
 					resp = newLazyRespSet(
 						span,
 						10*time.Minute,
@@ -1741,7 +1736,7 @@ func (s *BucketStore) Series(req *storepb.SeriesRequest, seriesSrv storepb.Store
 						shardMatcher,
 						false,
 						s.metrics.emptyPostingCount.WithLabelValues(tenant),
-						lazyRetrievalMaxBufferedResponses,
+						max(s.lazyRetrievalMaxBufferedResponses, 1),
 					)
 				}
 
